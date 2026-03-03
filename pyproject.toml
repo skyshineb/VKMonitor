@@ -7,10 +7,11 @@ name = "vk-wall-monitor"
 version = "0.1.0"
 description = "Simple VK wall keyword monitor with Telegram notifications."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
   "requests>=2.31,<3",
   "python-dotenv>=1.0,<2",
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

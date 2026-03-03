@@ -63,7 +63,7 @@ def parse_bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-@dataclass(slots=True)
+@dataclass
 class Config:
     vk_access_token: str
     tg_bot_token: str | None
@@ -84,7 +84,7 @@ class Config:
     http_timeout_seconds: float = 15.0
 
     def validate(self, command: str) -> None:
-        if not self.vk_access_token and command in {"run", "check-once", "test-vk"}:
+        if not self.vk_access_token and command in {"run", "check-once", "check_once", "test-vk", "test_vk"}:
             raise ValueError("VK_ACCESS_TOKEN is required.")
         if not self.vk_domain and self.vk_owner_id is None:
             raise ValueError("Set either VK_DOMAIN or VK_OWNER_ID.")
@@ -96,9 +96,9 @@ class Config:
             raise ValueError("interval_seconds must be >= 1.")
         if self.mode not in {"any", "all"}:
             raise ValueError("mode must be 'any' or 'all'.")
-        if command == "test-telegram" and (not self.tg_bot_token or not self.tg_chat_id):
+        if command in {"test-telegram", "test_telegram"} and (not self.tg_bot_token or not self.tg_chat_id):
             raise ValueError("TG_BOT_TOKEN and TG_CHAT_ID are required for test-telegram.")
-        if command in {"run", "check-once"} and not self.dry_run:
+        if command in {"run", "check-once", "check_once"} and not self.dry_run:
             if not self.tg_bot_token or not self.tg_chat_id:
                 raise ValueError("TG_BOT_TOKEN and TG_CHAT_ID are required unless --dry-run is set.")
         try:
@@ -474,9 +474,19 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.set_defaults(catch_up=None)
 
     add_common_flags(subparsers.add_parser("run", help="Run continuous polling loop."))
-    add_common_flags(subparsers.add_parser("check-once", help="Poll once and exit."))
-    add_common_flags(subparsers.add_parser("test-vk", help="Call VK and print latest posts."))
-    add_common_flags(subparsers.add_parser("test-telegram", help="Send Telegram test message."))
+    add_common_flags(
+        subparsers.add_parser("check-once", aliases=["check_once"], help="Poll once and exit.")
+    )
+    add_common_flags(
+        subparsers.add_parser("test-vk", aliases=["test_vk"], help="Call VK and print latest posts.")
+    )
+    add_common_flags(
+        subparsers.add_parser(
+            "test-telegram",
+            aliases=["test_telegram"],
+            help="Send Telegram test message.",
+        )
+    )
     return parser
 
 
@@ -599,11 +609,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "run":
             return command_run(monitor)
-        if args.command == "check-once":
+        if args.command in {"check-once", "check_once"}:
             return command_check_once(monitor)
-        if args.command == "test-vk":
+        if args.command in {"test-vk", "test_vk"}:
             return command_test_vk(monitor)
-        if args.command == "test-telegram":
+        if args.command in {"test-telegram", "test_telegram"}:
             return command_test_telegram(monitor)
         parser.error(f"Unknown command: {args.command}")
         return 2

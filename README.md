@@ -22,7 +22,7 @@ if previous run ended uncleanly, next startup sends a Telegram system alert.
 
 ## Quick setup (under 10 minutes)
 
-1. Install Python 3.11+ on Raspberry Pi.
+1. Install Python 3.9+ on Raspberry Pi.
 2. Clone/copy project.
 3. Create and activate virtual environment:
 
@@ -95,6 +95,8 @@ VK connectivity test:
 
 ```bash
 python -m vk_wall_monitor test-vk
+# also accepted:
+# python -m vk_wall_monitor test_vk
 ```
 
 Telegram test:
