@@ -264,6 +264,37 @@ def test_check_once_read_only_does_not_persist_state(tmp_path: Path) -> None:
     monitor.close()
 
 
+@responses.activate
+def test_check_once_read_only_without_state_still_matches(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={
+            "response": {
+                "items": [{"id": 2, "owner_id": -123, "date": 1_700_000_001, "text": "ALERT first check"}]
+            }
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 6}},
+        status=200,
+    )
+
+    sent = monitor.check_once_with_backoff(persist_state=False)
+
+    assert sent == 1
+    assert state.get_last_seen(-123) is None
+    assert state.is_notified(-123, 2) is False
+    monitor.close()
+
+
 def test_matcher_modes_regex_and_copy_history(tmp_path: Path) -> None:
     config_any = make_config(tmp_path, keywords=["foo", "bar"], mode="any")
     monitor_any = Monitor(config=config_any)

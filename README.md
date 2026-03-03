@@ -93,6 +93,7 @@ python -m vk_wall_monitor check-once
 
 `check-once` is read-only: it does not update SQLite state.
 Use it for diagnostics/manual checks, not for long-running deduplicated monitoring.
+If no state exists yet, it scans the fetched batch immediately (does not baseline-and-exit).
 
 VK connectivity test:
 

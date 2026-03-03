@@ -418,10 +418,16 @@ class Monitor:
 
         if last_seen is None:
             baseline = max(post_ids)
-            self.logger.info("State not initialized for owner %s, baseline=%s.", owner_id, baseline)
-            if persist_state and not self.config.dry_run:
-                self.state.set_last_seen(owner_id, baseline)
-            return 0
+            if persist_state:
+                self.logger.info("State not initialized for owner %s, baseline=%s.", owner_id, baseline)
+                if not self.config.dry_run:
+                    self.state.set_last_seen(owner_id, baseline)
+                return 0
+            last_seen = min(post_ids) - 1
+            self.logger.info(
+                "State not initialized for owner %s; running read-only scan over fetched posts.",
+                owner_id,
+            )
 
         new_posts = [post for post in posts if int(post["id"]) > last_seen]
         if not self.config.catch_up and new_posts:
