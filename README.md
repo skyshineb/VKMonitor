@@ -13,28 +13,34 @@ State is stored in SQLite to avoid duplicate alerts after restart.
 - Optional regex mode (`KEYWORDS_REGEX`) with case-insensitive search.
 - Searches in post text and `copy_history` text.
 - Duplicate protection with SQLite:
-  - `last_seen_post_id` per wall owner
-  - `notified_posts` table to avoid re-sending same post
+`last_seen_post_id` per wall owner; `notified_posts` table to avoid re-sending same post.
 - Telegram safety:
-  - max 1 msg/sec local pacing
-  - retries once on Telegram 429 using `retry_after`
-- VK backoff on rate limit/network:
-  - 5s, 15s, 60s, 300s
+max 1 msg/sec local pacing; retries once on Telegram 429 using `retry_after`.
+- VK backoff on rate limit/network: `5s, 15s, 60s, 300s`
 - Recovery system message:
-  - If previous run ended uncleanly, next startup sends a Telegram system alert.
+if previous run ended uncleanly, next startup sends a Telegram system alert.
 
 ## Quick setup (under 10 minutes)
 
 1. Install Python 3.11+ on Raspberry Pi.
 2. Clone/copy project.
-3. Install dependencies:
+3. Create and activate virtual environment:
 
 ```bash
-python -m pip install -e .
-python -m pip install -e ".[test]"   # optional, for tests
+python -m venv .venv
+source .venv/bin/activate
+# Windows PowerShell:
+# .venv\Scripts\Activate.ps1
 ```
 
-4. Create `.env` in project root:
+4. Install runtime dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+5. Create `.env` in project root:
 
 ```dotenv
 VK_ACCESS_TOKEN=your_vk_token
@@ -45,7 +51,7 @@ VK_DOMAIN=some_public_group
 TG_BOT_TOKEN=123456:ABCDEF
 TG_CHAT_ID=123456789
 
-KEYWORDS=discount, акция, promo
+KEYWORDS=discount,sale,promo
 # KEYWORDS_REGEX=promo\s+\d+
 
 MATCH_MODE=any
@@ -64,8 +70,7 @@ CATCH_UP=1
 2. Run `/newbot` and save the bot token as `TG_BOT_TOKEN`.
 3. Send any message to your bot from target chat.
 4. Get chat id:
-   - `https://api.telegram.org/bot<TG_BOT_TOKEN>/getUpdates`
-   - Find `chat.id` in response and use as `TG_CHAT_ID`.
+`https://api.telegram.org/bot<TG_BOT_TOKEN>/getUpdates` and use `chat.id` from response as `TG_CHAT_ID`.
 
 ## VK token note
 
@@ -78,29 +83,27 @@ Run loop:
 
 ```bash
 python -m vk_wall_monitor run
-# or
-vk-wall-monitor run
 ```
 
 Check once (for cron/timer):
 
 ```bash
-vk-wall-monitor check-once
+python -m vk_wall_monitor check-once
 ```
 
 VK connectivity test:
 
 ```bash
-vk-wall-monitor test-vk
+python -m vk_wall_monitor test-vk
 ```
 
 Telegram test:
 
 ```bash
-vk-wall-monitor test-telegram
+python -m vk_wall_monitor test-telegram
 ```
 
-Common options (all commands):
+Common options:
 
 - `--interval-seconds 30`
 - `--count 10`
@@ -108,6 +111,13 @@ Common options (all commands):
 - `--dry-run`
 - `--state-path ./state/vk_wall_monitor.sqlite`
 - `--catch-up` / `--no-catch-up`
+
+Optional: install as a CLI script:
+
+```bash
+python -m pip install -e .
+vk-wall-monitor run
+```
 
 ## systemd (recommended for long run)
 
@@ -123,7 +133,7 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/VKMonitor
-ExecStart=/usr/bin/python -m vk_wall_monitor run
+ExecStart=/home/pi/VKMonitor/.venv/bin/python -m vk_wall_monitor run
 Restart=always
 RestartSec=5
 EnvironmentFile=/home/pi/VKMonitor/.env
@@ -145,7 +155,7 @@ sudo systemctl status vk-wall-monitor.service
 Every minute:
 
 ```cron
-* * * * * cd /home/pi/VKMonitor && /usr/bin/python -m vk_wall_monitor check-once >> /var/log/vk-monitor.log 2>&1
+* * * * * cd /home/pi/VKMonitor && /home/pi/VKMonitor/.venv/bin/python -m vk_wall_monitor check-once >> /var/log/vk-monitor.log 2>&1
 ```
 
 ## Operational behavior
@@ -158,5 +168,6 @@ Every minute:
 ## Tests
 
 ```bash
+python -m pip install pytest responses
 pytest -q
 ```
