@@ -296,24 +296,33 @@ class Monitor:
         return texts
 
     def match_post(self, post: dict[str, Any]) -> list[str]:
-        texts = [normalize_whitespace(text).lower() for text in self._post_texts(post)]
+        texts = [normalize_whitespace(text) for text in self._post_texts(post)]
         if self.regex:
             found: list[str] = []
             for text in texts:
                 found.extend([m.group(0) for m in self.regex.finditer(text)])
-            unique = list(dict.fromkeys([item for item in found if item]))
+            seen: set[str] = set()
+            unique: list[str] = []
+            for item in found:
+                normalized = item.casefold()
+                if item and normalized not in seen:
+                    seen.add(normalized)
+                    unique.append(item)
             return unique if unique else []
 
-        normalized_keywords = [keyword.lower() for keyword in self.config.keywords]
-        if not normalized_keywords:
+        keyword_pairs = [(keyword, keyword.casefold()) for keyword in self.config.keywords]
+        if not keyword_pairs:
             return []
+        text_casefolded = [text.casefold() for text in texts]
 
         present_keywords = [
-            keyword for keyword in normalized_keywords if any(keyword in text for text in texts)
+            original_keyword
+            for original_keyword, folded_keyword in keyword_pairs
+            if any(folded_keyword in text for text in text_casefolded)
         ]
         if self.config.mode == "all":
-            if len(present_keywords) == len(normalized_keywords):
-                return normalized_keywords
+            if len(present_keywords) == len(keyword_pairs):
+                return [original_keyword for original_keyword, _ in keyword_pairs]
             return []
         return present_keywords
 
@@ -394,7 +403,7 @@ class Monitor:
         self.send_telegram_message(message)
         return True
 
-    def process_once(self) -> int:
+    def process_once(self, persist_state: bool = True) -> int:
         posts = self.fetch_vk_posts()
         if not posts:
             self.logger.info("VK returned no posts.")
@@ -410,7 +419,7 @@ class Monitor:
         if last_seen is None:
             baseline = max(post_ids)
             self.logger.info("State not initialized for owner %s, baseline=%s.", owner_id, baseline)
-            if not self.config.dry_run:
+            if persist_state and not self.config.dry_run:
                 self.state.set_last_seen(owner_id, baseline)
             return 0
 
@@ -425,7 +434,7 @@ class Monitor:
             post_id = int(post["id"])
             if self.state.is_notified(owner_id, post_id):
                 self.logger.info("Post %s already notified; skipping duplicate.", post_id)
-                if not self.config.dry_run:
+                if persist_state and not self.config.dry_run:
                     self.state.set_last_seen(owner_id, post_id)
                 continue
 
@@ -434,20 +443,20 @@ class Monitor:
                 message = self.build_post_message(post, matched_terms)
                 self.send_telegram_message(message)
                 sent_count += 1
-                if not self.config.dry_run:
+                if persist_state and not self.config.dry_run:
                     self.state.mark_notified(owner_id, post_id)
                     self.state.set_last_seen(owner_id, post_id)
             else:
-                if not self.config.dry_run:
+                if persist_state and not self.config.dry_run:
                     self.state.set_last_seen(owner_id, post_id)
 
         return sent_count
 
-    def check_once_with_backoff(self, max_attempts: int = 5) -> int:
+    def check_once_with_backoff(self, max_attempts: int = 5, persist_state: bool = True) -> int:
         attempt = 0
         while True:
             try:
-                return self.process_once()
+                return self.process_once(persist_state=persist_state)
             except VKTransientError as exc:
                 if attempt >= max_attempts - 1:
                     raise
@@ -558,7 +567,7 @@ def command_test_telegram(monitor: Monitor) -> int:
 
 
 def command_check_once(monitor: Monitor) -> int:
-    sent = monitor.check_once_with_backoff()
+    sent = monitor.check_once_with_backoff(persist_state=False)
     print(f"check-once complete. sent={sent}")
     return 0
 

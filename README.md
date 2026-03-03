@@ -9,10 +9,10 @@ State is stored in SQLite to avoid duplicate alerts after restart.
 
 - Default polling interval: 30 seconds (safe for one group).
 - VK target by either `VK_DOMAIN` or `VK_OWNER_ID`.
-- Keyword modes: `any` (default) / `all`.
+- Keyword modes: `any` (default) / `all` (case-insensitive for `KEYWORDS`).
 - Optional regex mode (`KEYWORDS_REGEX`) with case-insensitive search.
 - Searches in post text and `copy_history` text.
-- Duplicate protection with SQLite:
+- Duplicate protection with SQLite in `run` mode:
 `last_seen_post_id` per wall owner; `notified_posts` table to avoid re-sending same post.
 - Telegram safety:
 max 1 msg/sec local pacing; retries once on Telegram 429 using `retry_after`.
@@ -91,6 +91,9 @@ Check once (for cron/timer):
 python -m vk_wall_monitor check-once
 ```
 
+`check-once` is read-only: it does not update SQLite state.
+Use it for diagnostics/manual checks, not for long-running deduplicated monitoring.
+
 VK connectivity test:
 
 ```bash
@@ -152,7 +155,7 @@ sudo systemctl enable --now vk-wall-monitor.service
 sudo systemctl status vk-wall-monitor.service
 ```
 
-## cron option (single checks)
+## cron option (single checks, read-only)
 
 Every minute:
 
@@ -160,10 +163,14 @@ Every minute:
 * * * * * cd /home/pi/VKMonitor && /home/pi/VKMonitor/.venv/bin/python -m vk_wall_monitor check-once >> /var/log/vk-monitor.log 2>&1
 ```
 
+Note: because `check-once` is read-only, repeated cron runs can re-send alerts for the same post.
+Use `run` with systemd if you need deduplication across polling cycles.
+
 ## Operational behavior
 
 - First run is baseline-only: no historical spam.
-- `check-once` twice with same data does not send duplicates.
+- `run` updates state and prevents duplicate notifications across polls.
+- `check-once` does not save state (read-only mode) and may re-notify the same post on repeated runs.
 - On unclean stop (crash/power loss), next startup sends one recovery system message.
 - Tokens are never logged.
 

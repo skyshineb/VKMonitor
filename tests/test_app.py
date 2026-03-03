@@ -233,6 +233,37 @@ def test_pinned_post_replay_not_sent(tmp_path: Path) -> None:
     monitor.close()
 
 
+@responses.activate
+def test_check_once_read_only_does_not_persist_state(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    state.set_last_seen(-123, 1)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={
+            "response": {
+                "items": [{"id": 2, "owner_id": -123, "date": 1_700_000_001, "text": "alert read only"}]
+            }
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 5}},
+        status=200,
+    )
+
+    monitor.check_once_with_backoff(persist_state=False)
+
+    assert state.get_last_seen(-123) == 1
+    assert state.is_notified(-123, 2) is False
+    monitor.close()
+
+
 def test_matcher_modes_regex_and_copy_history(tmp_path: Path) -> None:
     config_any = make_config(tmp_path, keywords=["foo", "bar"], mode="any")
     monitor_any = Monitor(config=config_any)
@@ -256,5 +287,7 @@ def test_matcher_modes_regex_and_copy_history(tmp_path: Path) -> None:
     )
     monitor_regex = Monitor(config=config_regex)
     post_regex = {"id": 1, "owner_id": -123, "date": 1, "text": "Great PROMO 42 today"}
-    assert monitor_regex.match_post(post_regex) == ["promo 42"]
+    matched = monitor_regex.match_post(post_regex)
+    assert len(matched) == 1
+    assert matched[0].casefold() == "promo 42"
     monitor_regex.close()
