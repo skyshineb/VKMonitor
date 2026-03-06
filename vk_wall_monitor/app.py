@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -9,7 +10,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -81,6 +82,7 @@ class Config:
     catch_up: bool
     state_path: Path
     timezone_name: str
+    tg_updates_interval_seconds: int
     http_timeout_seconds: float = 15.0
 
     def validate(self, command: str) -> None:
@@ -94,6 +96,8 @@ class Config:
             raise ValueError("count must be in range 1..100.")
         if self.interval_seconds < 1:
             raise ValueError("interval_seconds must be >= 1.")
+        if self.tg_updates_interval_seconds < 1:
+            raise ValueError("tg_updates_interval_seconds must be >= 1.")
         if self.mode not in {"any", "all"}:
             raise ValueError("mode must be 'any' or 'all'.")
         if command in {"test-telegram", "test_telegram"} and (not self.tg_bot_token or not self.tg_chat_id):
@@ -215,6 +219,13 @@ class StateStore:
         self.set_meta("last_stop_at", datetime.now(timezone.utc).isoformat())
 
 
+@dataclass
+class CheckResult:
+    sent_count: int
+    last_checked_owner_id: int | None
+    last_checked_post_id: int | None
+
+
 class Monitor:
     def __init__(
         self,
@@ -331,6 +342,16 @@ class Monitor:
         dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc).astimezone(local_tz)
         return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
+    def _format_iso_timestamp_for_status(self, iso_ts: str | None) -> str:
+        if not iso_ts:
+            return "n/a"
+        try:
+            dt = datetime.fromisoformat(iso_ts)
+        except ValueError:
+            return "n/a"
+        local_tz = ZoneInfo(self.config.timezone_name)
+        return dt.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
     def build_post_message(self, post: dict[str, Any], matched_terms: list[str]) -> str:
         owner_id = int(post["owner_id"])
         post_id = int(post["id"])
@@ -366,6 +387,97 @@ class Monitor:
         data = {"chat_id": self.config.tg_chat_id, "text": text}
         self._send_telegram_with_retry(url, data)
         self.last_telegram_send_monotonic = self.monotonic()
+
+    def _get_last_tg_update_id(self) -> int:
+        raw = self.state.get_meta("last_tg_update_id", "0") or "0"
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    def _is_status_command(self, text: str) -> bool:
+        normalized = normalize_whitespace(text)
+        return bool(re.match(r"^/status(?:@[\w_]+)?(?:\s|$)", normalized, re.IGNORECASE))
+
+    def _build_status_message(self) -> str:
+        last_check = self._format_iso_timestamp_for_status(self.state.get_meta("last_check_at"))
+        next_check = self._format_iso_timestamp_for_status(self.state.get_meta("next_check_at"))
+        owner_id = self.state.get_meta("last_checked_owner_id")
+        post_id = self.state.get_meta("last_checked_post_id")
+        last_post = "n/a"
+        if owner_id and post_id:
+            last_post = f"{owner_id}_{post_id}"
+        return "\n".join(
+            [
+                "running: yes",
+                f"last check: {last_check}",
+                f"next check: {next_check}",
+                f"last checked post: {last_post}",
+            ]
+        )
+
+    def handle_status_command(self, chat_id: str) -> None:
+        if not self.config.tg_chat_id or chat_id != self.config.tg_chat_id:
+            return
+        self.send_telegram_message(self._build_status_message())
+
+    def handle_telegram_update(self, update: dict[str, Any]) -> None:
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            return
+        chat_id = str(chat.get("id", ""))
+        text = message.get("text")
+        if not isinstance(text, str):
+            return
+        if self._is_status_command(text):
+            self.handle_status_command(chat_id)
+
+    def poll_telegram_updates_once(self) -> None:
+        if not self.config.tg_bot_token or not self.config.tg_chat_id:
+            self.logger.warning("Skipping getUpdates polling: TG_BOT_TOKEN/TG_CHAT_ID is not configured.")
+            return
+
+        url = f"{TG_API_BASE}/bot{self.config.tg_bot_token}/getUpdates"
+        offset = self._get_last_tg_update_id() + 1
+        params = {"offset": offset, "timeout": 0, "allowed_updates": json.dumps(["message"])}
+
+        try:
+            response = self.session.get(url, params=params, timeout=self.config.http_timeout_seconds)
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError, requests.RequestException) as exc:
+            self.logger.warning("Telegram getUpdates failed: %s", exc)
+            return
+        except ValueError as exc:
+            self.logger.warning("Telegram getUpdates invalid JSON response: %s", exc)
+            return
+
+        if not payload.get("ok", False):
+            self.logger.warning("Telegram getUpdates API error: %s", payload)
+            return
+
+        updates = payload.get("result", [])
+        if not isinstance(updates, list):
+            self.logger.warning("Telegram getUpdates returned invalid result type.")
+            return
+
+        max_update_id: int | None = None
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
+            try:
+                self.handle_telegram_update(update)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                self.logger.warning("Failed to handle Telegram update: %s", exc)
+
+        if max_update_id is not None:
+            self.state.set_meta("last_tg_update_id", str(max_update_id))
 
     def _send_telegram_with_retry(self, url: str, data: dict[str, str]) -> None:
         response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
@@ -403,18 +515,18 @@ class Monitor:
         self.send_telegram_message(message)
         return True
 
-    def process_once(self, persist_state: bool = True) -> int:
+    def process_once(self, persist_state: bool = True) -> CheckResult:
         posts = self.fetch_vk_posts()
         if not posts:
             self.logger.info("VK returned no posts.")
-            return 0
+            return CheckResult(sent_count=0, last_checked_owner_id=None, last_checked_post_id=None)
 
         owner_id = int(posts[0].get("owner_id", self.config.vk_owner_id))
         last_seen = self.state.get_last_seen(owner_id)
         post_ids = [int(post.get("id", 0)) for post in posts if "id" in post]
         if not post_ids:
             self.logger.info("No valid post IDs in VK response.")
-            return 0
+            return CheckResult(sent_count=0, last_checked_owner_id=owner_id, last_checked_post_id=None)
 
         if last_seen is None:
             baseline = max(post_ids)
@@ -422,7 +534,11 @@ class Monitor:
                 self.logger.info("State not initialized for owner %s, baseline=%s.", owner_id, baseline)
                 if not self.config.dry_run:
                     self.state.set_last_seen(owner_id, baseline)
-                return 0
+                return CheckResult(
+                    sent_count=0,
+                    last_checked_owner_id=owner_id,
+                    last_checked_post_id=baseline,
+                )
             last_seen = min(post_ids) - 1
             self.logger.info(
                 "State not initialized for owner %s; running read-only scan over fetched posts.",
@@ -434,6 +550,7 @@ class Monitor:
             newest = max(new_posts, key=lambda post: int(post["id"]))
             new_posts = [newest]
         new_posts.sort(key=lambda post: int(post["id"]))
+        last_checked_post_id = max(int(post["id"]) for post in new_posts) if new_posts else max(post_ids)
 
         sent_count = 0
         for post in new_posts:
@@ -456,13 +573,17 @@ class Monitor:
                 if persist_state and not self.config.dry_run:
                     self.state.set_last_seen(owner_id, post_id)
 
-        return sent_count
+        return CheckResult(
+            sent_count=sent_count,
+            last_checked_owner_id=owner_id,
+            last_checked_post_id=last_checked_post_id,
+        )
 
     def check_once_with_backoff(self, max_attempts: int = 5, persist_state: bool = True) -> int:
         attempt = 0
         while True:
             try:
-                return self.process_once(persist_state=persist_state)
+                return self.process_once(persist_state=persist_state).sent_count
             except VKTransientError as exc:
                 if attempt >= max_attempts - 1:
                     raise
@@ -522,6 +643,7 @@ def build_config(args: argparse.Namespace) -> Config:
         if args.interval_seconds is not None
         else int(env("POLL_INTERVAL_SECONDS", "30"))
     )
+    tg_updates_interval = int(env("TG_UPDATES_INTERVAL_SECONDS", "30"))
     mode = (args.mode or env("MATCH_MODE", "any") or "any").strip().lower()
     catch_up = args.catch_up
     if catch_up is None:
@@ -545,6 +667,7 @@ def build_config(args: argparse.Namespace) -> Config:
         catch_up=bool(catch_up),
         state_path=Path(state_path_raw),
         timezone_name=env("TIMEZONE", "Europe/Berlin") or "Europe/Berlin",
+        tg_updates_interval_seconds=tg_updates_interval,
     )
 
 
@@ -584,21 +707,50 @@ def command_run(monitor: Monitor) -> int:
     logger = logging.getLogger("vk_wall_monitor")
 
     backoff_index = 0
+    now_monotonic = monitor.monotonic()
+    next_vk_due = now_monotonic
+    next_tg_due = now_monotonic
+    monitor.state.set_meta("next_check_at", datetime.now(timezone.utc).isoformat())
+
     try:
         while True:
-            monitor.process_once()
-            backoff_index = 0
-            monitor.sleep(monitor.config.interval_seconds)
+            now_monotonic = monitor.monotonic()
+
+            if now_monotonic >= next_vk_due:
+                next_delay = monitor.config.interval_seconds
+                try:
+                    result = monitor.process_once()
+                    backoff_index = 0
+                    if result.last_checked_owner_id is not None and result.last_checked_post_id is not None:
+                        monitor.state.set_meta("last_checked_owner_id", str(result.last_checked_owner_id))
+                        monitor.state.set_meta("last_checked_post_id", str(result.last_checked_post_id))
+                except VKTransientError as exc:
+                    delay = BACKOFF_SCHEDULE_SECONDS[min(backoff_index, len(BACKOFF_SCHEDULE_SECONDS) - 1)]
+                    backoff_index = min(backoff_index + 1, len(BACKOFF_SCHEDULE_SECONDS) - 1)
+                    monitor.state.set_last_error(str(exc))
+                    logger.warning("Transient VK error in run loop: %s. Sleeping %ss.", exc, delay)
+                    next_delay = delay
+
+                finished_at = datetime.now(timezone.utc)
+                monitor.state.set_meta("last_check_at", finished_at.isoformat())
+                monitor.state.set_meta(
+                    "next_check_at",
+                    (finished_at + timedelta(seconds=next_delay)).isoformat(),
+                )
+                next_vk_due = monitor.monotonic() + next_delay
+
+            now_monotonic = monitor.monotonic()
+            if now_monotonic >= next_tg_due:
+                monitor.poll_telegram_updates_once()
+                next_tg_due = monitor.monotonic() + monitor.config.tg_updates_interval_seconds
+
+            sleep_for = max(0.0, min(next_vk_due, next_tg_due) - monitor.monotonic())
+            if sleep_for > 0:
+                monitor.sleep(sleep_for)
     except KeyboardInterrupt:
         logger.info("Received stop signal, shutting down cleanly.")
         monitor.state.mark_clean_shutdown()
         return 0
-    except VKTransientError as exc:
-        delay = BACKOFF_SCHEDULE_SECONDS[min(backoff_index, len(BACKOFF_SCHEDULE_SECONDS) - 1)]
-        monitor.state.set_last_error(str(exc))
-        logger.warning("Transient VK error in run loop: %s. Sleeping %ss.", exc, delay)
-        monitor.sleep(delay)
-        return command_run(monitor)
     except Exception as exc:
         monitor.state.set_last_error(str(exc))
         logger.exception("Monitor stopped with error.")

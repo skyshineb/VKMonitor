@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs
 
 import responses
 
-from vk_wall_monitor.app import Config, Monitor, StateStore
+from vk_wall_monitor.app import Config, Monitor, StateStore, command_run
 
 
 VK_URL = "https://api.vk.com/method/wall.get"
@@ -29,6 +30,7 @@ def make_config(tmp_path: Path, **overrides) -> Config:
         catch_up=True,
         state_path=tmp_path / "state.sqlite",
         timezone_name="Europe/Berlin",
+        tg_updates_interval_seconds=30,
     )
     for key, value in overrides.items():
         setattr(base, key, value)
@@ -39,8 +41,18 @@ def tg_url(config: Config) -> str:
     return f"https://api.telegram.org/bot{config.tg_bot_token}/sendMessage"
 
 
+def tg_get_updates_url(config: Config) -> str:
+    return f"https://api.telegram.org/bot{config.tg_bot_token}/getUpdates"
+
+
 def count_calls(calls, marker: str) -> int:
     return sum(1 for call in calls if marker in call.request.url)
+
+
+def extract_message_text(call) -> str:
+    body = call.request.body
+    parsed = parse_qs(body.decode() if isinstance(body, bytes) else body)
+    return parsed["text"][0]
 
 
 @responses.activate
@@ -322,3 +334,167 @@ def test_matcher_modes_regex_and_copy_history(tmp_path: Path) -> None:
     assert len(matched) == 1
     assert matched[0].casefold() == "promo 42"
     monitor_regex.close()
+
+
+@responses.activate
+def test_status_command_in_allowed_chat_returns_core_fields(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    state.set_meta("last_check_at", "2026-03-06T10:00:00+00:00")
+    state.set_meta("next_check_at", "2026-03-06T10:00:30+00:00")
+    state.set_meta("last_checked_owner_id", "-123")
+    state.set_meta("last_checked_post_id", "77")
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={
+            "ok": True,
+            "result": [
+                {"update_id": 101, "message": {"chat": {"id": 123456}, "text": "/status"}},
+            ],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 10}},
+        status=200,
+    )
+
+    monitor.poll_telegram_updates_once()
+
+    send_calls = [call for call in responses.calls if "/sendMessage" in call.request.url]
+    assert len(send_calls) == 1
+    text = extract_message_text(send_calls[0])
+    assert "running: yes" in text
+    assert "last check:" in text
+    assert "next check:" in text
+    assert "last checked post: -123_77" in text
+    assert state.get_meta("last_tg_update_id") == "101"
+    monitor.close()
+
+
+@responses.activate
+def test_status_command_in_wrong_chat_is_ignored(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={
+            "ok": True,
+            "result": [
+                {"update_id": 102, "message": {"chat": {"id": 999999}, "text": "/status@SomeBot"}},
+            ],
+        },
+        status=200,
+    )
+
+    monitor.poll_telegram_updates_once()
+
+    assert count_calls(responses.calls, "/sendMessage") == 0
+    assert state.get_meta("last_tg_update_id") == "102"
+    monitor.close()
+
+
+@responses.activate
+def test_get_updates_offset_prevents_duplicate_status_reply(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    first_update = {"update_id": 200, "message": {"chat": {"id": 123456}, "text": "/status"}}
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={"ok": True, "result": [first_update]},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 11}},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={"ok": True, "result": []},
+        status=200,
+    )
+
+    monitor.poll_telegram_updates_once()
+    monitor.poll_telegram_updates_once()
+
+    assert count_calls(responses.calls, "/sendMessage") == 1
+    get_calls = [call for call in responses.calls if "/getUpdates" in call.request.url]
+    assert "offset=201" in get_calls[1].request.url
+    monitor.close()
+
+
+@responses.activate
+def test_get_updates_http_error_does_not_raise(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        body="bad gateway",
+        status=502,
+    )
+
+    monitor.poll_telegram_updates_once()
+
+    assert count_calls(responses.calls, "/sendMessage") == 0
+    monitor.close()
+
+
+@responses.activate
+def test_run_updates_check_schedule_and_last_checked_post(tmp_path: Path) -> None:
+    config = make_config(tmp_path, interval_seconds=30, tg_updates_interval_seconds=30)
+    state = StateStore(config.state_path)
+    state.set_last_seen(-123, 1)
+    sleeps: list[float] = []
+
+    def stop_after_first_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monitor = Monitor(config=config, state=state, sleeper=stop_after_first_sleep)
+
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={
+            "response": {
+                "items": [{"id": 2, "owner_id": -123, "date": 1_700_000_001, "text": "no keyword hit"}]
+            }
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={"ok": True, "result": []},
+        status=200,
+    )
+
+    exit_code = command_run(monitor)
+
+    assert exit_code == 0
+    assert state.get_meta("last_checked_owner_id") == "-123"
+    assert state.get_meta("last_checked_post_id") == "2"
+    last_check = state.get_meta("last_check_at")
+    next_check = state.get_meta("next_check_at")
+    assert last_check is not None
+    assert next_check is not None
+    assert datetime.fromisoformat(next_check) > datetime.fromisoformat(last_check)
+    assert sleeps
+    monitor.close()

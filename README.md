@@ -16,6 +16,8 @@ State is stored in SQLite to avoid duplicate alerts after restart.
 `last_seen_post_id` per wall owner; `notified_posts` table to avoid re-sending same post.
 - Telegram safety:
 max 1 msg/sec local pacing; retries once on Telegram 429 using `retry_after`.
+- Telegram inbound commands:
+periodic `getUpdates` polling in `run` mode (default every 30s) with `/status` support.
 - VK backoff on rate limit/network: `5s, 15s, 60s, 300s`
 - Recovery system message:
 if previous run ended uncleanly, next startup sends a Telegram system alert.
@@ -56,6 +58,7 @@ KEYWORDS=discount,sale,promo
 
 MATCH_MODE=any
 POLL_INTERVAL_SECONDS=30
+TG_UPDATES_INTERVAL_SECONDS=30
 VK_COUNT=10
 VK_FILTER=owner
 VK_API_VERSION=5.199
@@ -90,6 +93,18 @@ Check once (for cron/timer):
 ```bash
 python -m vk_wall_monitor check-once
 ```
+
+Status command (in configured `TG_CHAT_ID`):
+
+```text
+/status
+```
+
+Bot replies with:
+- `running: yes`
+- `last check: ...`
+- `next check: ...`
+- `last checked post: owner_id_post_id` (or `n/a`)
 
 `check-once` is read-only: it does not update SQLite state.
 Use it for diagnostics/manual checks, not for long-running deduplicated monitoring.
