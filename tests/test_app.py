@@ -532,3 +532,78 @@ def test_run_updates_check_schedule_and_last_checked_post(tmp_path: Path) -> Non
     assert datetime.fromisoformat(next_check) > datetime.fromisoformat(last_check)
     assert sleeps
     monitor.close()
+
+
+def test_buffered_meta_not_visible_in_db_until_flush(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    state.set_meta("last_check_at", "2026-03-06T10:00:00+00:00")
+
+    # In-memory cache should return buffered value immediately.
+    assert state.get_meta("last_check_at") == "2026-03-06T10:00:00+00:00"
+
+    # Fresh connection should not see buffered value before flush.
+    fresh = StateStore(config.state_path)
+    assert fresh.get_meta("last_check_at") is None
+    fresh.close()
+
+    state.commit_with_pending_meta()
+    fresh2 = StateStore(config.state_path)
+    assert fresh2.get_meta("last_check_at") == "2026-03-06T10:00:00+00:00"
+    fresh2.close()
+    state.close()
+
+
+def test_important_write_flushes_pending_meta(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    state.set_meta("last_check_at", "2026-03-06T10:00:00+00:00")
+    state.set_last_seen(-123, 5, commit=True)
+
+    fresh = StateStore(config.state_path)
+    assert fresh.get_meta("last_check_at") == "2026-03-06T10:00:00+00:00"
+    assert fresh.get_last_seen(-123) == 5
+    fresh.close()
+    state.close()
+
+
+@responses.activate
+def test_last_tg_update_id_persisted_on_updates(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={
+            "ok": True,
+            "result": [
+                {"update_id": 501, "message": {"chat": {"id": 123456}, "text": "/status"}},
+            ],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 99}},
+        status=200,
+    )
+
+    monitor.poll_telegram_updates_once()
+    monitor.close()
+
+    fresh = StateStore(config.state_path)
+    assert fresh.get_meta("last_tg_update_id") == "501"
+    fresh.close()
+
+
+def test_set_meta_noop_same_value_does_not_dirty(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    state.set_meta("last_check_at", "same-value")
+    first_pending = dict(state._pending_meta)
+    state.set_meta("last_check_at", "same-value")
+    assert state._pending_meta == first_pending
+    state.close()

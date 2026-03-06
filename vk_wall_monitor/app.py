@@ -117,6 +117,9 @@ class StateStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
+        self._meta_cache: dict[str, str] = {}
+        self._pending_meta: dict[str, str] = {}
+        self._meta_cache_loaded = False
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -144,7 +147,40 @@ class StateStore:
         self.conn.commit()
 
     def close(self) -> None:
+        self.commit_with_pending_meta()
         self.conn.close()
+
+    def _load_meta_cache(self) -> None:
+        if self._meta_cache_loaded:
+            return
+        rows = self.conn.execute("SELECT key, value FROM runtime_meta").fetchall()
+        self._meta_cache = {str(row["key"]): str(row["value"]) for row in rows}
+        self._meta_cache_loaded = True
+
+    def _upsert_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_meta(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+    def flush_pending_meta(self) -> None:
+        if not self._pending_meta:
+            return
+        pending_items = list(self._pending_meta.items())
+        self._pending_meta.clear()
+        for key, value in pending_items:
+            self._upsert_meta(key, value)
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def commit_with_pending_meta(self) -> None:
+        self.flush_pending_meta()
+        self.conn.commit()
 
     def get_last_seen(self, owner_id: int) -> int | None:
         row = self.conn.execute(
@@ -153,7 +189,7 @@ class StateStore:
         ).fetchone()
         return int(row["last_seen_post_id"]) if row else None
 
-    def set_last_seen(self, owner_id: int, post_id: int) -> None:
+    def set_last_seen(self, owner_id: int, post_id: int, commit: bool = True) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
@@ -165,7 +201,8 @@ class StateStore:
             """,
             (owner_id, post_id, now_iso),
         )
-        self.conn.commit()
+        if commit:
+            self.commit_with_pending_meta()
 
     def is_notified(self, owner_id: int, post_id: int) -> bool:
         row = self.conn.execute(
@@ -174,7 +211,7 @@ class StateStore:
         ).fetchone()
         return row is not None
 
-    def mark_notified(self, owner_id: int, post_id: int) -> None:
+    def mark_notified(self, owner_id: int, post_id: int, commit: bool = True) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
@@ -183,25 +220,29 @@ class StateStore:
             """,
             (owner_id, post_id, now_iso),
         )
-        self.conn.commit()
+        if commit:
+            self.commit_with_pending_meta()
 
     def get_meta(self, key: str, default: str | None = None) -> str | None:
-        row = self.conn.execute("SELECT value FROM runtime_meta WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else default
+        self._load_meta_cache()
+        value = self._meta_cache.get(key)
+        return value if value is not None else default
 
-    def set_meta(self, key: str, value: str) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO runtime_meta(key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, value),
-        )
-        self.conn.commit()
+    def set_meta(self, key: str, value: str, immediate: bool = False) -> None:
+        self._load_meta_cache()
+        current = self._pending_meta.get(key, self._meta_cache.get(key))
+        if current == value:
+            return
+
+        self._meta_cache[key] = value
+        if immediate:
+            self._pending_meta.pop(key, None)
+            self._upsert_meta(key, value)
+            return
+        self._pending_meta[key] = value
 
     def set_last_error(self, message: str) -> None:
-        self.set_meta("last_error", message[:2000])
+        self.set_meta("last_error", message[:2000], immediate=False)
 
     def start_runtime(self) -> tuple[bool, str | None]:
         initialized = parse_bool(self.get_meta("initialized"), False)
@@ -209,14 +250,15 @@ class StateStore:
         last_error = self.get_meta("last_error")
         was_unclean = initialized and not shutdown_clean
 
-        self.set_meta("initialized", "1")
-        self.set_meta("shutdown_clean", "0")
-        self.set_meta("last_start_at", datetime.now(timezone.utc).isoformat())
+        self.set_meta("initialized", "1", immediate=False)
+        self.set_meta("shutdown_clean", "0", immediate=False)
+        self.set_meta("last_start_at", datetime.now(timezone.utc).isoformat(), immediate=False)
         return was_unclean, last_error
 
     def mark_clean_shutdown(self) -> None:
-        self.set_meta("shutdown_clean", "1")
-        self.set_meta("last_stop_at", datetime.now(timezone.utc).isoformat())
+        self.set_meta("shutdown_clean", "1", immediate=False)
+        self.set_meta("last_stop_at", datetime.now(timezone.utc).isoformat(), immediate=False)
+        self.commit_with_pending_meta()
 
 
 @dataclass
@@ -475,7 +517,8 @@ class Monitor:
                 self.logger.warning("Failed to handle Telegram update: %s", exc)
 
         if max_update_id is not None:
-            self.state.set_meta("last_tg_update_id", str(max_update_id))
+            self.state.set_meta("last_tg_update_id", str(max_update_id), immediate=False)
+            self.state.commit_with_pending_meta()
 
     def _send_telegram_with_retry(self, url: str, data: dict[str, str]) -> None:
         response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
@@ -531,7 +574,7 @@ class Monitor:
             if persist_state:
                 self.logger.info("State not initialized for owner %s, baseline=%s.", owner_id, baseline)
                 if not self.config.dry_run:
-                    self.state.set_last_seen(owner_id, baseline)
+                    self.state.set_last_seen(owner_id, baseline, commit=True)
                 return CheckResult(
                     sent_count=0,
                     last_checked_owner_id=owner_id,
@@ -556,7 +599,7 @@ class Monitor:
             if self.state.is_notified(owner_id, post_id):
                 self.logger.info("Post %s already notified; skipping duplicate.", post_id)
                 if persist_state and not self.config.dry_run:
-                    self.state.set_last_seen(owner_id, post_id)
+                    self.state.set_last_seen(owner_id, post_id, commit=True)
                 continue
 
             matched_terms = self.match_post(post)
@@ -565,11 +608,12 @@ class Monitor:
                 self.send_telegram_message(message)
                 sent_count += 1
                 if persist_state and not self.config.dry_run:
-                    self.state.mark_notified(owner_id, post_id)
-                    self.state.set_last_seen(owner_id, post_id)
+                    self.state.mark_notified(owner_id, post_id, commit=False)
+                    self.state.set_last_seen(owner_id, post_id, commit=False)
+                    self.state.commit_with_pending_meta()
             else:
                 if persist_state and not self.config.dry_run:
-                    self.state.set_last_seen(owner_id, post_id)
+                    self.state.set_last_seen(owner_id, post_id, commit=True)
 
         return CheckResult(
             sent_count=sent_count,
@@ -708,7 +752,7 @@ def command_run(monitor: Monitor) -> int:
     now_monotonic = monitor.monotonic()
     next_vk_due = now_monotonic
     next_tg_due = now_monotonic
-    monitor.state.set_meta("next_check_at", datetime.now(timezone.utc).isoformat())
+    monitor.state.set_meta("next_check_at", datetime.now(timezone.utc).isoformat(), immediate=False)
 
     try:
         while True:
@@ -720,8 +764,16 @@ def command_run(monitor: Monitor) -> int:
                     result = monitor.process_once()
                     backoff_index = 0
                     if result.last_checked_owner_id is not None and result.last_checked_post_id is not None:
-                        monitor.state.set_meta("last_checked_owner_id", str(result.last_checked_owner_id))
-                        monitor.state.set_meta("last_checked_post_id", str(result.last_checked_post_id))
+                        monitor.state.set_meta(
+                            "last_checked_owner_id",
+                            str(result.last_checked_owner_id),
+                            immediate=False,
+                        )
+                        monitor.state.set_meta(
+                            "last_checked_post_id",
+                            str(result.last_checked_post_id),
+                            immediate=False,
+                        )
                 except VKTransientError as exc:
                     delay = BACKOFF_SCHEDULE_SECONDS[min(backoff_index, len(BACKOFF_SCHEDULE_SECONDS) - 1)]
                     backoff_index = min(backoff_index + 1, len(BACKOFF_SCHEDULE_SECONDS) - 1)
@@ -730,10 +782,11 @@ def command_run(monitor: Monitor) -> int:
                     next_delay = delay
 
                 finished_at = datetime.now(timezone.utc)
-                monitor.state.set_meta("last_check_at", finished_at.isoformat())
+                monitor.state.set_meta("last_check_at", finished_at.isoformat(), immediate=False)
                 monitor.state.set_meta(
                     "next_check_at",
                     (finished_at + timedelta(seconds=next_delay)).isoformat(),
+                    immediate=False,
                 )
                 next_vk_due = monitor.monotonic() + next_delay
 
@@ -751,6 +804,7 @@ def command_run(monitor: Monitor) -> int:
         return 0
     except Exception as exc:
         monitor.state.set_last_error(str(exc))
+        monitor.state.commit_with_pending_meta()
         logger.exception("Monitor stopped with error.")
         return 1
 
@@ -784,10 +838,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except VKAuthError as exc:
         monitor.state.set_last_error(str(exc))
+        monitor.state.commit_with_pending_meta()
         print(str(exc), file=sys.stderr)
         return 1
     except VKMonitorError as exc:
         monitor.state.set_last_error(str(exc))
+        monitor.state.commit_with_pending_meta()
         print(str(exc), file=sys.stderr)
         return 1
     finally:
