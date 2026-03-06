@@ -369,10 +369,10 @@ def test_status_command_in_allowed_chat_returns_core_fields(tmp_path: Path) -> N
     send_calls = [call for call in responses.calls if "/sendMessage" in call.request.url]
     assert len(send_calls) == 1
     text = extract_message_text(send_calls[0])
-    assert "running: yes" in text
-    assert "last check:" in text
-    assert "next check:" in text
-    assert "last checked post: -123_77" in text
+    assert "🟢 Running: yes" in text
+    assert "🕒 Last check:" in text
+    assert "next check:" not in text
+    assert "🔗 Last checked post: https://vk.com/wall-123_77" in text
     assert state.get_meta("last_tg_update_id") == "101"
     monitor.close()
 
@@ -453,6 +453,40 @@ def test_get_updates_http_error_does_not_raise(tmp_path: Path) -> None:
     monitor.poll_telegram_updates_once()
 
     assert count_calls(responses.calls, "/sendMessage") == 0
+    monitor.close()
+
+
+@responses.activate
+def test_status_command_without_last_post_shows_na(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    state.set_meta("last_check_at", "2026-03-06T10:00:00+00:00")
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={
+            "ok": True,
+            "result": [
+                {"update_id": 300, "message": {"chat": {"id": 123456}, "text": "/status"}},
+            ],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 12}},
+        status=200,
+    )
+
+    monitor.poll_telegram_updates_once()
+
+    send_calls = [call for call in responses.calls if "/sendMessage" in call.request.url]
+    assert len(send_calls) == 1
+    text = extract_message_text(send_calls[0])
+    assert "🔗 Last checked post: n/a" in text
     monitor.close()
 
 

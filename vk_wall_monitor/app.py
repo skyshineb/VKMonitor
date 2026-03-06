@@ -401,18 +401,16 @@ class Monitor:
 
     def _build_status_message(self) -> str:
         last_check = self._format_iso_timestamp_for_status(self.state.get_meta("last_check_at"))
-        next_check = self._format_iso_timestamp_for_status(self.state.get_meta("next_check_at"))
         owner_id = self.state.get_meta("last_checked_owner_id")
         post_id = self.state.get_meta("last_checked_post_id")
         last_post = "n/a"
         if owner_id and post_id:
-            last_post = f"{owner_id}_{post_id}"
+            last_post = f"https://vk.com/wall{owner_id}_{post_id}"
         return "\n".join(
             [
-                "running: yes",
-                f"last check: {last_check}",
-                f"next check: {next_check}",
-                f"last checked post: {last_post}",
+                "🟢 Running: yes",
+                f"🕒 Last check: {last_check}",
+                f"🔗 Last checked post: {last_post}",
             ]
         )
 

@@ -101,10 +101,9 @@ Status command (in configured `TG_CHAT_ID`):
 ```
 
 Bot replies with:
-- `running: yes`
-- `last check: ...`
-- `next check: ...`
-- `last checked post: owner_id_post_id` (or `n/a`)
+- `🟢 Running: yes`
+- `🕒 Last check: ...`
+- `🔗 Last checked post: https://vk.com/wall{owner_id}_{post_id}` (or `n/a`)
 
 `check-once` is read-only: it does not update SQLite state.
 Use it for diagnostics/manual checks, not for long-running deduplicated monitoring.
