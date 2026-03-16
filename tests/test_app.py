@@ -769,6 +769,7 @@ def test_daily_digest_single_post_with_photo_uses_url_mode_by_default_and_persis
     assert "name=\"photo\"" not in body_text(photo_calls[0])
     photo_body = parse_qs(body_text(photo_calls[0]))
     assert photo_body["photo"][0] == "https://img/1.jpg"
+    assert "1️⃣ Digest body" in photo_body["caption"][0]
     assert "Digest body" in photo_body["caption"][0]
     assert "https://vk.com/wall-123" in photo_body["caption"][0]
     assert count_calls(responses.calls, "https://img/1.jpg") == 0

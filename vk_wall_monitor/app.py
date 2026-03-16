@@ -925,7 +925,7 @@ class Monitor:
 
     def _build_digest_text_messages(self, entries: list[DailyDigestPost], source_link: str) -> list[str]:
         sections = [
-            f"{self._section_number(index)}\n{entry.text}"
+            f"{self._section_number(index)} {entry.text}"
             for index, entry in enumerate(entries, start=1)
         ]
         messages: list[str] = []
