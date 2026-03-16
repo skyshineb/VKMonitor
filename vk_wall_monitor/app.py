@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import signal
@@ -13,6 +15,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -302,6 +305,14 @@ class DailyDigestPost:
     digest_date_local: str
 
 
+@dataclass
+class DownloadedPhoto:
+    source_url: str
+    filename: str
+    content_type: str
+    content: bytes
+
+
 class Monitor:
     def __init__(
         self,
@@ -589,9 +600,20 @@ class Monitor:
             ]
         )
 
-    def _send_telegram_request(self, method: str, data: dict[str, str]) -> None:
+    def _send_telegram_request(
+        self,
+        method: str,
+        data: dict[str, str],
+        files: dict[str, tuple[str, io.BytesIO, str]] | None = None,
+        error_context: str | None = None,
+    ) -> None:
         url = f"{TG_API_BASE}/bot{self.config.tg_bot_token}/{method}"
-        response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
+        response = self.session.post(
+            url,
+            data=data,
+            files=files,
+            timeout=self.config.http_timeout_seconds,
+        )
         if response.status_code == 429:
             retry_after = 1
             try:
@@ -603,9 +625,21 @@ class Monitor:
                 pass
             self.logger.warning("Telegram rate limited. Retrying in %ss.", retry_after)
             self.sleep(max(1, retry_after))
-            response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
+            response = self.session.post(
+                url,
+                data=data,
+                files=files,
+                timeout=self.config.http_timeout_seconds,
+            )
 
         if response.status_code >= 400:
+            if error_context:
+                self.logger.warning(
+                    "Telegram %s failed (%s): %s",
+                    method,
+                    error_context,
+                    response.text[:300],
+                )
             raise TelegramError(f"Telegram HTTP {response.status_code}: {response.text[:300]}")
 
         try:
@@ -613,6 +647,8 @@ class Monitor:
         except ValueError as exc:
             raise TelegramError(f"Telegram invalid JSON response: {exc}") from exc
         if not payload.get("ok", False):
+            if error_context:
+                self.logger.warning("Telegram %s API error (%s): %s", method, error_context, payload)
             raise TelegramError(f"Telegram API error: {payload}")
 
     def send_telegram_message(self, text: str) -> None:
@@ -633,6 +669,69 @@ class Monitor:
         )
         self.last_telegram_send_monotonic = self.monotonic()
 
+    def _guess_photo_filename(self, url: str, content_type: str | None) -> str:
+        parsed = urlparse(url)
+        filename = Path(parsed.path).name or "photo"
+        if "." not in filename:
+            guessed_ext = mimetypes.guess_extension((content_type or "").split(";")[0].strip())
+            if guessed_ext:
+                filename = f"{filename}{guessed_ext}"
+            else:
+                filename = f"{filename}.jpg"
+        return filename
+
+    def _download_photo(self, photo_url: str) -> DownloadedPhoto:
+        try:
+            response = self.session.get(photo_url, timeout=self.config.http_timeout_seconds)
+            response.raise_for_status()
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError, requests.RequestException) as exc:
+            self.logger.warning(
+                "Failed to download digest photo from %s: %s: %s",
+                photo_url,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise TelegramError(f"Failed to download digest photo: {photo_url}") from exc
+
+        content_type = str(response.headers.get("Content-Type", "image/jpeg")).strip() or "image/jpeg"
+        return DownloadedPhoto(
+            source_url=photo_url,
+            filename=self._guess_photo_filename(photo_url, content_type),
+            content_type=content_type,
+            content=response.content,
+        )
+
+    def _download_photo_batch(self, photo_urls: list[str]) -> list[DownloadedPhoto]:
+        return [self._download_photo(photo_url) for photo_url in photo_urls]
+
+    def send_telegram_photo(self, photo_url: str, caption: str | None = None) -> None:
+        if self.config.dry_run:
+            self.logger.info("[DRY RUN] Telegram photo: %s", photo_url)
+            if caption:
+                self.logger.info("[DRY RUN] Telegram photo caption:\n%s", caption)
+            return
+        if not self.config.tg_bot_token or not self.config.tg_chat_id:
+            raise TelegramError("Telegram token/chat is not configured.")
+
+        photo = self._download_photo(photo_url)
+        data = {"chat_id": self.config.tg_chat_id}
+        if caption:
+            data["caption"] = caption
+        files = {
+            "photo": (
+                photo.filename,
+                io.BytesIO(photo.content),
+                photo.content_type,
+            )
+        }
+        self._send_telegram_request(
+            "sendPhoto",
+            data,
+            files=files,
+            error_context=f"url={photo.source_url}",
+        )
+        self.last_telegram_send_monotonic = self.monotonic()
+
     def send_telegram_media_group(self, photo_urls: list[str], caption: str | None = None) -> None:
         if not photo_urls:
             return
@@ -646,15 +745,25 @@ class Monitor:
 
         for index in range(0, len(photo_urls), TELEGRAM_MEDIA_GROUP_LIMIT):
             chunk = photo_urls[index : index + TELEGRAM_MEDIA_GROUP_LIMIT]
+            downloaded = self._download_photo_batch(chunk)
             media: list[dict[str, str]] = []
-            for media_index, photo_url in enumerate(chunk):
-                item: dict[str, str] = {"type": "photo", "media": photo_url}
+            files: dict[str, tuple[str, io.BytesIO, str]] = {}
+            for media_index, photo in enumerate(downloaded):
+                attachment_name = f"photo{media_index}"
+                item: dict[str, str] = {"type": "photo", "media": f"attach://{attachment_name}"}
                 if index == 0 and media_index == 0 and caption:
                     item["caption"] = caption
                 media.append(item)
+                files[attachment_name] = (
+                    photo.filename,
+                    io.BytesIO(photo.content),
+                    photo.content_type,
+                )
             self._send_telegram_request(
                 "sendMediaGroup",
                 {"chat_id": self.config.tg_chat_id, "media": json.dumps(media)},
+                files=files,
+                error_context=f"batch_size={len(chunk)} urls={', '.join(chunk)}",
             )
             self.last_telegram_send_monotonic = self.monotonic()
 
@@ -804,13 +913,19 @@ class Monitor:
         )
 
         if can_combine_single_post:
-            self.send_telegram_media_group(all_photo_urls, caption=text_messages[0])
+            if len(all_photo_urls) == 1:
+                self.send_telegram_photo(all_photo_urls[0], caption=text_messages[0])
+            else:
+                self.send_telegram_media_group(all_photo_urls, caption=text_messages[0])
             return True
 
         for text in text_messages:
             self.send_telegram_message(text)
         if all_photo_urls:
-            self.send_telegram_media_group(all_photo_urls)
+            if len(all_photo_urls) == 1:
+                self.send_telegram_photo(all_photo_urls[0])
+            else:
+                self.send_telegram_media_group(all_photo_urls)
         return True
 
     def _entries_from_posts(self, posts: list[dict[str, Any]]) -> list[DailyDigestPost]:

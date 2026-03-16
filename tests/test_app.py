@@ -54,6 +54,10 @@ def tg_media_group_url(config: Config) -> str:
     return f"https://api.telegram.org/bot{config.tg_bot_token}/sendMediaGroup"
 
 
+def tg_photo_url(config: Config) -> str:
+    return f"https://api.telegram.org/bot{config.tg_bot_token}/sendPhoto"
+
+
 def count_calls(calls, marker: str) -> int:
     return sum(1 for call in calls if marker in call.request.url)
 
@@ -68,6 +72,13 @@ def extract_media_payload(call) -> list[dict[str, str]]:
     body = call.request.body
     parsed = parse_qs(body.decode() if isinstance(body, bytes) else body)
     return json.loads(parsed["media"][0])
+
+
+def body_text(call) -> str:
+    body = call.request.body
+    if isinstance(body, bytes):
+        return body.decode("utf-8", errors="ignore")
+    return body
 
 
 def utc_ts(year: int, month: int, day: int, hour: int = 10, minute: int = 0) -> int:
@@ -714,7 +725,7 @@ def test_daily_digest_buffer_is_in_memory_until_send(tmp_path: Path) -> None:
 
 
 @responses.activate
-def test_daily_digest_single_post_with_photo_sends_one_media_group_and_persists(tmp_path: Path) -> None:
+def test_daily_digest_single_post_with_photo_sends_one_photo_and_persists(tmp_path: Path) -> None:
     config = make_config(tmp_path, enable_daily_digest=True)
     state = StateStore(config.state_path)
     monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
@@ -737,21 +748,75 @@ def test_daily_digest_single_post_with_photo_sends_one_media_group_and_persists(
         )
     }
     responses.add(
+        responses.GET,
+        "https://img/1.jpg",
+        body=b"jpg-data",
+        headers={"Content-Type": "image/jpeg"},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_photo_url(config),
+        json={"ok": True, "result": {"message_id": 500}},
+        status=200,
+    )
+
+    monitor.process_daily_digest_due()
+
+    photo_calls = [call for call in responses.calls if "/sendPhoto" in call.request.url]
+    assert len(photo_calls) == 1
+    assert "name=\"photo\"" in body_text(photo_calls[0])
+    assert "Digest body" in body_text(photo_calls[0])
+    assert "https://vk.com/wall-123" in body_text(photo_calls[0])
+    assert count_calls(responses.calls, "/sendMessage") == 0
+    assert count_calls(responses.calls, "/sendMediaGroup") == 0
+    assert state.get_meta("last_daily_digest_date_sent") == "2023-11-14"
+    assert target_date.isoformat() not in monitor.daily_digest_buffer
+    monitor.close()
+
+
+@responses.activate
+def test_daily_digest_single_post_multiple_photos_uses_media_group_with_caption(tmp_path: Path) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True)
+    monitor = Monitor(config=config, sleeper=lambda _: None)
+    entry = monitor.build_daily_digest_post(
+        {
+            "id": 1,
+            "owner_id": -123,
+            "date": 1_700_000_001,
+            "text": "Single post text",
+            "attachments": [
+                {
+                    "type": "photo",
+                    "photo": {"sizes": [{"url": f"https://img/single-{index}.jpg", "width": 10, "height": 10}]},
+                }
+                for index in range(1, 4)
+            ],
+        }
+    )
+    for index in range(1, 4):
+        responses.add(
+            responses.GET,
+            f"https://img/single-{index}.jpg",
+            body=f"img-{index}".encode(),
+            headers={"Content-Type": "image/jpeg"},
+            status=200,
+        )
+    responses.add(
         responses.POST,
         tg_media_group_url(config),
         json={"ok": True, "result": []},
         status=200,
     )
 
-    monitor.process_daily_digest_due()
+    monitor.send_daily_digest_entries([entry] if entry is not None else [], "https://vk.com/wall-123")
 
     media_calls = [call for call in responses.calls if "/sendMediaGroup" in call.request.url]
     assert len(media_calls) == 1
-    media = extract_media_payload(media_calls[0])
-    assert media[0]["caption"].endswith("https://vk.com/wall-123")
-    assert count_calls(responses.calls, "/sendMessage") == 0
-    assert state.get_meta("last_daily_digest_date_sent") == "2023-11-14"
-    assert target_date.isoformat() not in monitor.daily_digest_buffer
+    body = body_text(media_calls[0])
+    assert "attach://photo0" in body
+    assert "caption" in body
+    assert "Single post text" in body
     monitor.close()
 
 
@@ -797,6 +862,14 @@ def test_daily_digest_multiple_posts_sends_text_and_splits_media_groups(tmp_path
         json={"ok": True, "result": {"message_id": 300}},
         status=200,
     )
+    for index in range(1, 12):
+        responses.add(
+            responses.GET,
+            f"https://img/{index}.jpg",
+            body=f"img-{index}".encode(),
+            headers={"Content-Type": "image/jpeg"},
+            status=200,
+        )
     responses.add(
         responses.POST,
         tg_media_group_url(config),
@@ -817,8 +890,93 @@ def test_daily_digest_multiple_posts_sends_text_and_splits_media_groups(tmp_path
     assert len(send_calls) == 1
     assert "https://vk.com/wall-123" in extract_message_text(send_calls[0])
     assert len(media_calls) == 2
-    assert len(extract_media_payload(media_calls[0])) == 10
-    assert len(extract_media_payload(media_calls[1])) == 1
+    assert "attach://photo0" in body_text(media_calls[0])
+    assert "attach://photo9" in body_text(media_calls[0])
+    assert "caption" not in body_text(media_calls[0])
+    assert "attach://photo0" in body_text(media_calls[1])
+    assert "attach://photo1" not in body_text(media_calls[1])
+    monitor.close()
+
+
+@responses.activate
+def test_send_telegram_photo_logs_failed_download_url(tmp_path: Path, caplog) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True)
+    monitor = Monitor(config=config, sleeper=lambda _: None)
+    responses.add(
+        responses.GET,
+        "https://img/fail.jpg",
+        body="missing",
+        status=404,
+    )
+
+    try:
+        monitor.send_telegram_photo("https://img/fail.jpg", caption="x")
+        assert False, "expected download failure"
+    except Exception as exc:
+        assert "https://img/fail.jpg" in str(exc)
+
+    assert "https://img/fail.jpg" in caplog.text
+    assert "Failed to download digest photo" in caplog.text
+    monitor.close()
+
+
+@responses.activate
+def test_send_telegram_photo_logs_failed_upload_url(tmp_path: Path, caplog) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True)
+    monitor = Monitor(config=config, sleeper=lambda _: None)
+    responses.add(
+        responses.GET,
+        "https://img/upload.jpg",
+        body=b"jpg-data",
+        headers={"Content-Type": "image/jpeg"},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_photo_url(config),
+        json={"ok": False, "description": "bad"},
+        status=400,
+    )
+
+    try:
+        monitor.send_telegram_photo("https://img/upload.jpg")
+        assert False, "expected upload failure"
+    except Exception as exc:
+        assert "Telegram HTTP 400" in str(exc)
+
+    assert "https://img/upload.jpg" in caplog.text
+    assert "Telegram sendPhoto failed" in caplog.text
+    monitor.close()
+
+
+@responses.activate
+def test_send_telegram_media_group_logs_failed_batch_urls(tmp_path: Path, caplog) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True)
+    monitor = Monitor(config=config, sleeper=lambda _: None)
+    for suffix in ("a", "b"):
+        responses.add(
+            responses.GET,
+            f"https://img/{suffix}.jpg",
+            body=f"img-{suffix}".encode(),
+            headers={"Content-Type": "image/jpeg"},
+            status=200,
+        )
+    responses.add(
+        responses.POST,
+        tg_media_group_url(config),
+        json={"ok": False, "description": "bad"},
+        status=400,
+    )
+
+    try:
+        monitor.send_telegram_media_group(["https://img/a.jpg", "https://img/b.jpg"])
+        assert False, "expected media group upload failure"
+    except Exception as exc:
+        assert "Telegram HTTP 400" in str(exc)
+
+    assert "https://img/a.jpg" in caplog.text
+    assert "https://img/b.jpg" in caplog.text
+    assert "Telegram sendMediaGroup failed" in caplog.text
     monitor.close()
 
 
