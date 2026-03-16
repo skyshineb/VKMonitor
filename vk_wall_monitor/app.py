@@ -611,12 +611,17 @@ class Monitor:
         error_context: str | None = None,
     ) -> None:
         url = f"{TG_API_BASE}/bot{self.config.tg_bot_token}/{method}"
-        response = self.session.post(
-            url,
-            data=data,
-            files=files,
-            timeout=self.config.http_timeout_seconds,
-        )
+        try:
+            response = self.session.post(
+                url,
+                data=data,
+                files=files,
+                timeout=self.config.http_timeout_seconds,
+            )
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+            if error_context:
+                self.logger.warning("Telegram %s request failed (%s): %s", method, error_context, exc)
+            raise TelegramError(f"Telegram request failed: {exc}") from exc
         if response.status_code == 429:
             retry_after = 1
             try:
@@ -628,12 +633,17 @@ class Monitor:
                 pass
             self.logger.warning("Telegram rate limited. Retrying in %ss.", retry_after)
             self.sleep(max(1, retry_after))
-            response = self.session.post(
-                url,
-                data=data,
-                files=files,
-                timeout=self.config.http_timeout_seconds,
-            )
+            try:
+                response = self.session.post(
+                    url,
+                    data=data,
+                    files=files,
+                    timeout=self.config.http_timeout_seconds,
+                )
+            except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+                if error_context:
+                    self.logger.warning("Telegram %s retry failed (%s): %s", method, error_context, exc)
+                raise TelegramError(f"Telegram request failed: {exc}") from exc
 
         if response.status_code >= 400:
             if error_context:
@@ -1339,9 +1349,12 @@ def command_check_once(monitor: Monitor) -> int:
 
 def command_run(monitor: Monitor) -> int:
     _install_sigterm_handler()
-    monitor.maybe_send_recovery_message()
-    monitor.initialize_daily_digest_schedule()
     logger = logging.getLogger("vk_wall_monitor")
+    try:
+        monitor.maybe_send_recovery_message()
+    except TelegramError as exc:
+        logger.warning("Skipping recovery message after Telegram failure: %s", exc)
+    monitor.initialize_daily_digest_schedule()
 
     backoff_index = 0
     now_monotonic = monitor.monotonic()

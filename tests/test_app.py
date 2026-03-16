@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs
 
+import requests
 import responses
 
 from vk_wall_monitor.app import Config, Monitor, StateStore, command_run
@@ -242,6 +243,46 @@ def test_recovery_message_only_after_unclean_stop(tmp_path: Path) -> None:
     monitor_clean = Monitor(config=clean_config, state=state_clean, sleeper=lambda _: None)
     assert monitor_clean.maybe_send_recovery_message() is False
     monitor_clean.close()
+
+
+@responses.activate
+def test_run_ignores_recovery_message_timeout_and_continues(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = StateStore(config.state_path)
+    state.set_meta("initialized", "1")
+    state.set_meta("shutdown_clean", "0")
+    state.set_meta("last_error", "boom")
+    state.set_last_seen(-123, 1)
+    sleeps: list[float] = []
+
+    def stop_after_first_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monitor = Monitor(config=config, state=state, sleeper=stop_after_first_sleep)
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        body=requests.exceptions.ReadTimeout("timeout"),
+    )
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={"response": {"items": [{"id": 2, "owner_id": -123, "date": 1_700_000_001, "text": "no hit"}]}},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={"ok": True, "result": []},
+        status=200,
+    )
+
+    exit_code = command_run(monitor)
+
+    assert exit_code == 0
+    assert sleeps
+    monitor.close()
 
 
 @responses.activate
