@@ -107,6 +107,7 @@ class Config:
     enable_daily_digest: bool
     daily_digest_time: str
     digest_line_excludes: list[str]
+    digest_image_mode: str
     http_timeout_seconds: float = 15.0
 
     def validate(self, command: str) -> None:
@@ -124,6 +125,8 @@ class Config:
             raise ValueError("tg_updates_interval_seconds must be >= 1.")
         if self.mode not in {"any", "all"}:
             raise ValueError("mode must be 'any' or 'all'.")
+        if self.digest_image_mode not in {"url", "upload"}:
+            raise ValueError("digest_image_mode must be 'url' or 'upload'.")
         if command == "run" and not self.enable_instant_alerts and not self.enable_daily_digest:
             raise ValueError("At least one of ENABLE_INSTANT_ALERTS or ENABLE_DAILY_DIGEST must be enabled.")
         if command in {"test-telegram", "test_telegram"} and (not self.tg_bot_token or not self.tg_chat_id):
@@ -704,6 +707,51 @@ class Monitor:
     def _download_photo_batch(self, photo_urls: list[str]) -> list[DownloadedPhoto]:
         return [self._download_photo(photo_url) for photo_url in photo_urls]
 
+    def send_telegram_photo_by_url(self, photo_url: str, caption: str | None = None) -> None:
+        if self.config.dry_run:
+            self.logger.info("[DRY RUN] Telegram photo by URL: %s", photo_url)
+            if caption:
+                self.logger.info("[DRY RUN] Telegram photo by URL caption:\n%s", caption)
+            return
+        if not self.config.tg_bot_token or not self.config.tg_chat_id:
+            raise TelegramError("Telegram token/chat is not configured.")
+
+        data = {"chat_id": self.config.tg_chat_id, "photo": photo_url}
+        if caption:
+            data["caption"] = caption
+        self._send_telegram_request(
+            "sendPhoto",
+            data,
+            error_context=f"url={photo_url}",
+        )
+        self.last_telegram_send_monotonic = self.monotonic()
+
+    def send_telegram_media_group_by_url(self, photo_urls: list[str], caption: str | None = None) -> None:
+        if not photo_urls:
+            return
+        if self.config.dry_run:
+            self.logger.info("[DRY RUN] Telegram media group by URL: %s", photo_urls)
+            if caption:
+                self.logger.info("[DRY RUN] Telegram media group by URL caption:\n%s", caption)
+            return
+        if not self.config.tg_bot_token or not self.config.tg_chat_id:
+            raise TelegramError("Telegram token/chat is not configured.")
+
+        for index in range(0, len(photo_urls), TELEGRAM_MEDIA_GROUP_LIMIT):
+            chunk = photo_urls[index : index + TELEGRAM_MEDIA_GROUP_LIMIT]
+            media: list[dict[str, str]] = []
+            for media_index, photo_url in enumerate(chunk):
+                item: dict[str, str] = {"type": "photo", "media": photo_url}
+                if index == 0 and media_index == 0 and caption:
+                    item["caption"] = caption
+                media.append(item)
+            self._send_telegram_request(
+                "sendMediaGroup",
+                {"chat_id": self.config.tg_chat_id, "media": json.dumps(media)},
+                error_context=f"legacy_url_batch={', '.join(chunk)}",
+            )
+            self.last_telegram_send_monotonic = self.monotonic()
+
     def send_telegram_photo(self, photo_url: str, caption: str | None = None) -> None:
         if self.config.dry_run:
             self.logger.info("[DRY RUN] Telegram photo: %s", photo_url)
@@ -766,6 +814,21 @@ class Monitor:
                 error_context=f"batch_size={len(chunk)} urls={', '.join(chunk)}",
             )
             self.last_telegram_send_monotonic = self.monotonic()
+
+    def send_digest_photos(self, photo_urls: list[str], caption: str | None = None) -> None:
+        if not photo_urls:
+            return
+        if len(photo_urls) == 1:
+            if self.config.digest_image_mode == "upload":
+                self.send_telegram_photo(photo_urls[0], caption=caption)
+            else:
+                self.send_telegram_photo_by_url(photo_urls[0], caption=caption)
+            return
+
+        if self.config.digest_image_mode == "upload":
+            self.send_telegram_media_group(photo_urls, caption=caption)
+        else:
+            self.send_telegram_media_group_by_url(photo_urls, caption=caption)
 
     def _get_last_tg_update_id(self) -> int:
         raw = self.state.get_meta("last_tg_update_id", "0") or "0"
@@ -913,19 +976,13 @@ class Monitor:
         )
 
         if can_combine_single_post:
-            if len(all_photo_urls) == 1:
-                self.send_telegram_photo(all_photo_urls[0], caption=text_messages[0])
-            else:
-                self.send_telegram_media_group(all_photo_urls, caption=text_messages[0])
+            self.send_digest_photos(all_photo_urls, caption=text_messages[0])
             return True
 
         for text in text_messages:
             self.send_telegram_message(text)
         if all_photo_urls:
-            if len(all_photo_urls) == 1:
-                self.send_telegram_photo(all_photo_urls[0])
-            else:
-                self.send_telegram_media_group(all_photo_urls)
+            self.send_digest_photos(all_photo_urls)
         return True
 
     def _entries_from_posts(self, posts: list[dict[str, Any]]) -> list[DailyDigestPost]:
@@ -1246,6 +1303,7 @@ def build_config(args: argparse.Namespace) -> Config:
         enable_daily_digest=parse_bool(env("ENABLE_DAILY_DIGEST"), False),
         daily_digest_time=env("DAILY_DIGEST_TIME", "08:00") or "08:00",
         digest_line_excludes=parse_csv_list(env("DIGEST_LINE_EXCLUDES")),
+        digest_image_mode=(env("DIGEST_IMAGE_MODE", "url") or "url").strip().lower(),
     )
 
 

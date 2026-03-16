@@ -36,6 +36,7 @@ def make_config(tmp_path: Path, **overrides) -> Config:
         enable_daily_digest=False,
         daily_digest_time="08:00",
         digest_line_excludes=[],
+        digest_image_mode="url",
     )
     for key, value in overrides.items():
         setattr(base, key, value)
@@ -647,6 +648,13 @@ def test_config_validate_rejects_invalid_daily_time_and_disabled_modes(tmp_path:
     except ValueError as exc:
         assert "HH:MM" in str(exc)
 
+    config_invalid_image_mode = make_config(tmp_path, digest_image_mode="broken", state_path=tmp_path / "image-mode.sqlite")
+    try:
+        config_invalid_image_mode.validate("run")
+        assert False, "expected invalid digest image mode to fail"
+    except ValueError as exc:
+        assert "digest_image_mode" in str(exc)
+
     config_disabled = make_config(
         tmp_path,
         enable_instant_alerts=False,
@@ -725,7 +733,7 @@ def test_daily_digest_buffer_is_in_memory_until_send(tmp_path: Path) -> None:
 
 
 @responses.activate
-def test_daily_digest_single_post_with_photo_sends_one_photo_and_persists(tmp_path: Path) -> None:
+def test_daily_digest_single_post_with_photo_uses_url_mode_by_default_and_persists(tmp_path: Path) -> None:
     config = make_config(tmp_path, enable_daily_digest=True)
     state = StateStore(config.state_path)
     monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
@@ -748,13 +756,6 @@ def test_daily_digest_single_post_with_photo_sends_one_photo_and_persists(tmp_pa
         )
     }
     responses.add(
-        responses.GET,
-        "https://img/1.jpg",
-        body=b"jpg-data",
-        headers={"Content-Type": "image/jpeg"},
-        status=200,
-    )
-    responses.add(
         responses.POST,
         tg_photo_url(config),
         json={"ok": True, "result": {"message_id": 500}},
@@ -765,9 +766,12 @@ def test_daily_digest_single_post_with_photo_sends_one_photo_and_persists(tmp_pa
 
     photo_calls = [call for call in responses.calls if "/sendPhoto" in call.request.url]
     assert len(photo_calls) == 1
-    assert "name=\"photo\"" in body_text(photo_calls[0])
-    assert "Digest body" in body_text(photo_calls[0])
-    assert "https://vk.com/wall-123" in body_text(photo_calls[0])
+    assert "name=\"photo\"" not in body_text(photo_calls[0])
+    photo_body = parse_qs(body_text(photo_calls[0]))
+    assert photo_body["photo"][0] == "https://img/1.jpg"
+    assert "Digest body" in photo_body["caption"][0]
+    assert "https://vk.com/wall-123" in photo_body["caption"][0]
+    assert count_calls(responses.calls, "https://img/1.jpg") == 0
     assert count_calls(responses.calls, "/sendMessage") == 0
     assert count_calls(responses.calls, "/sendMediaGroup") == 0
     assert state.get_meta("last_daily_digest_date_sent") == "2023-11-14"
@@ -794,14 +798,6 @@ def test_daily_digest_single_post_multiple_photos_uses_media_group_with_caption(
             ],
         }
     )
-    for index in range(1, 4):
-        responses.add(
-            responses.GET,
-            f"https://img/single-{index}.jpg",
-            body=f"img-{index}".encode(),
-            headers={"Content-Type": "image/jpeg"},
-            status=200,
-        )
     responses.add(
         responses.POST,
         tg_media_group_url(config),
@@ -813,10 +809,52 @@ def test_daily_digest_single_post_multiple_photos_uses_media_group_with_caption(
 
     media_calls = [call for call in responses.calls if "/sendMediaGroup" in call.request.url]
     assert len(media_calls) == 1
-    body = body_text(media_calls[0])
-    assert "attach://photo0" in body
-    assert "caption" in body
-    assert "Single post text" in body
+    media = extract_media_payload(media_calls[0])
+    assert media[0]["media"] == "https://img/single-1.jpg"
+    assert all(not item["media"].startswith("attach://") for item in media)
+    assert media[0]["caption"]
+    assert "Single post text" in media[0]["caption"]
+    monitor.close()
+
+
+@responses.activate
+def test_daily_digest_upload_mode_downloads_photo_before_sending(tmp_path: Path) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True, digest_image_mode="upload")
+    monitor = Monitor(config=config, sleeper=lambda _: None)
+    entry = monitor.build_daily_digest_post(
+        {
+            "id": 6,
+            "owner_id": -123,
+            "date": 1_700_000_001,
+            "text": "Upload mode text",
+            "attachments": [
+                {
+                    "type": "photo",
+                    "photo": {"sizes": [{"url": "https://img/upload-mode.jpg", "width": 50, "height": 50}]},
+                }
+            ],
+        }
+    )
+    responses.add(
+        responses.GET,
+        "https://img/upload-mode.jpg",
+        body=b"jpg-data",
+        headers={"Content-Type": "image/jpeg"},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_photo_url(config),
+        json={"ok": True, "result": {"message_id": 501}},
+        status=200,
+    )
+
+    monitor.send_daily_digest_entries([entry] if entry is not None else [], "https://vk.com/wall-123")
+
+    photo_calls = [call for call in responses.calls if "/sendPhoto" in call.request.url]
+    assert len(photo_calls) == 1
+    assert "name=\"photo\"" in body_text(photo_calls[0])
+    assert count_calls(responses.calls, "https://img/upload-mode.jpg") == 1
     monitor.close()
 
 
@@ -862,14 +900,6 @@ def test_daily_digest_multiple_posts_sends_text_and_splits_media_groups(tmp_path
         json={"ok": True, "result": {"message_id": 300}},
         status=200,
     )
-    for index in range(1, 12):
-        responses.add(
-            responses.GET,
-            f"https://img/{index}.jpg",
-            body=f"img-{index}".encode(),
-            headers={"Content-Type": "image/jpeg"},
-            status=200,
-        )
     responses.add(
         responses.POST,
         tg_media_group_url(config),
@@ -890,11 +920,12 @@ def test_daily_digest_multiple_posts_sends_text_and_splits_media_groups(tmp_path
     assert len(send_calls) == 1
     assert "https://vk.com/wall-123" in extract_message_text(send_calls[0])
     assert len(media_calls) == 2
-    assert "attach://photo0" in body_text(media_calls[0])
-    assert "attach://photo9" in body_text(media_calls[0])
-    assert "caption" not in body_text(media_calls[0])
-    assert "attach://photo0" in body_text(media_calls[1])
-    assert "attach://photo1" not in body_text(media_calls[1])
+    first_media = extract_media_payload(media_calls[0])
+    second_media = extract_media_payload(media_calls[1])
+    assert first_media[0]["media"] == "https://img/1.jpg"
+    assert first_media[-1]["media"] == "https://img/10.jpg"
+    assert all("caption" not in item for item in first_media)
+    assert second_media[0]["media"] == "https://img/11.jpg"
     monitor.close()
 
 
