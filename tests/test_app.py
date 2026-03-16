@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -31,6 +32,10 @@ def make_config(tmp_path: Path, **overrides) -> Config:
         state_path=tmp_path / "state.sqlite",
         timezone_name="Europe/Berlin",
         tg_updates_interval_seconds=30,
+        enable_instant_alerts=True,
+        enable_daily_digest=False,
+        daily_digest_time="08:00",
+        digest_line_excludes=[],
     )
     for key, value in overrides.items():
         setattr(base, key, value)
@@ -45,6 +50,10 @@ def tg_get_updates_url(config: Config) -> str:
     return f"https://api.telegram.org/bot{config.tg_bot_token}/getUpdates"
 
 
+def tg_media_group_url(config: Config) -> str:
+    return f"https://api.telegram.org/bot{config.tg_bot_token}/sendMediaGroup"
+
+
 def count_calls(calls, marker: str) -> int:
     return sum(1 for call in calls if marker in call.request.url)
 
@@ -53,6 +62,16 @@ def extract_message_text(call) -> str:
     body = call.request.body
     parsed = parse_qs(body.decode() if isinstance(body, bytes) else body)
     return parsed["text"][0]
+
+
+def extract_media_payload(call) -> list[dict[str, str]]:
+    body = call.request.body
+    parsed = parse_qs(body.decode() if isinstance(body, bytes) else body)
+    return json.loads(parsed["media"][0])
+
+
+def utc_ts(year: int, month: int, day: int, hour: int = 10, minute: int = 0) -> int:
+    return int(datetime(year, month, day, hour, minute, tzinfo=timezone.utc).timestamp())
 
 
 @responses.activate
@@ -607,3 +626,301 @@ def test_set_meta_noop_same_value_does_not_dirty(tmp_path: Path) -> None:
     state.set_meta("last_check_at", "same-value")
     assert state._pending_meta == first_pending
     state.close()
+
+
+def test_config_validate_rejects_invalid_daily_time_and_disabled_modes(tmp_path: Path) -> None:
+    config_invalid_time = make_config(tmp_path, daily_digest_time="25:99")
+    try:
+        config_invalid_time.validate("run")
+        assert False, "expected invalid daily digest time to fail"
+    except ValueError as exc:
+        assert "HH:MM" in str(exc)
+
+    config_disabled = make_config(
+        tmp_path,
+        enable_instant_alerts=False,
+        enable_daily_digest=False,
+        state_path=tmp_path / "disabled.sqlite",
+    )
+    try:
+        config_disabled.validate("run")
+        assert False, "expected disabled modes to fail"
+    except ValueError as exc:
+        assert "At least one" in str(exc)
+
+
+def test_daily_digest_filters_lines_and_collects_copy_history_photo(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        enable_daily_digest=True,
+        digest_line_excludes=["sale", "spam"],
+    )
+    monitor = Monitor(config=config)
+    post = {
+        "id": 10,
+        "owner_id": -123,
+        "date": 1_700_000_001,
+        "text": "Keep me\nSALE today\nAnother line",
+        "copy_history": [
+            {
+                "text": "Spam line\nCopied keep",
+                "attachments": [
+                    {
+                        "type": "photo",
+                        "photo": {
+                            "sizes": [
+                                {"url": "https://img/small.jpg", "width": 10, "height": 10},
+                                {"url": "https://img/big.jpg", "width": 100, "height": 100},
+                            ]
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    digest_post = monitor.build_daily_digest_post(post)
+
+    assert digest_post is not None
+    assert digest_post.text == "Keep me\nAnother line\nCopied keep"
+    assert digest_post.photo_urls == ["https://img/big.jpg"]
+    monitor.close()
+
+
+@responses.activate
+def test_daily_digest_buffer_is_in_memory_until_send(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        enable_instant_alerts=False,
+        enable_daily_digest=True,
+    )
+    state = StateStore(config.state_path)
+    state.set_last_seen(-123, 1)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={"response": {"items": [{"id": 2, "owner_id": -123, "date": 1_700_000_001, "text": "digest text"}]}},
+        status=200,
+    )
+
+    monitor.process_once()
+
+    assert "2023-11-14" in monitor.daily_digest_buffer
+    fresh = StateStore(config.state_path)
+    assert fresh.get_meta("last_daily_digest_date_sent") is None
+    fresh.close()
+    monitor.close()
+
+
+@responses.activate
+def test_daily_digest_single_post_with_photo_sends_one_media_group_and_persists(tmp_path: Path) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True)
+    state = StateStore(config.state_path)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+    target_date = date(2023, 11, 14)
+    monitor.pending_daily_digest_date = target_date
+    monitor.daily_digest_buffer[target_date.isoformat()] = {
+        (-123, 5): monitor.build_daily_digest_post(
+            {
+                "id": 5,
+                "owner_id": -123,
+                "date": 1_700_000_001,
+                "text": "Digest body",
+                "attachments": [
+                    {
+                        "type": "photo",
+                        "photo": {"sizes": [{"url": "https://img/1.jpg", "width": 50, "height": 50}]},
+                    }
+                ],
+            }
+        )
+    }
+    responses.add(
+        responses.POST,
+        tg_media_group_url(config),
+        json={"ok": True, "result": []},
+        status=200,
+    )
+
+    monitor.process_daily_digest_due()
+
+    media_calls = [call for call in responses.calls if "/sendMediaGroup" in call.request.url]
+    assert len(media_calls) == 1
+    media = extract_media_payload(media_calls[0])
+    assert media[0]["caption"].endswith("https://vk.com/wall-123")
+    assert count_calls(responses.calls, "/sendMessage") == 0
+    assert state.get_meta("last_daily_digest_date_sent") == "2023-11-14"
+    assert target_date.isoformat() not in monitor.daily_digest_buffer
+    monitor.close()
+
+
+@responses.activate
+def test_daily_digest_multiple_posts_sends_text_and_splits_media_groups(tmp_path: Path) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True)
+    monitor = Monitor(config=config, sleeper=lambda _: None)
+    entries = [
+        monitor.build_daily_digest_post(
+            {
+                "id": 1,
+                "owner_id": -123,
+                "date": 1_700_000_001,
+                "text": "First digest text",
+                "attachments": [
+                    {
+                        "type": "photo",
+                        "photo": {"sizes": [{"url": f"https://img/{index}.jpg", "width": 10, "height": 10}]},
+                    }
+                    for index in range(1, 7)
+                ],
+            }
+        ),
+        monitor.build_daily_digest_post(
+            {
+                "id": 2,
+                "owner_id": -123,
+                "date": 1_700_000_101,
+                "text": "Second digest text",
+                "attachments": [
+                    {
+                        "type": "photo",
+                        "photo": {"sizes": [{"url": f"https://img/{index}.jpg", "width": 10, "height": 10}]},
+                    }
+                    for index in range(7, 12)
+                ],
+            }
+        ),
+    ]
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 300}},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_media_group_url(config),
+        json={"ok": True, "result": []},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_media_group_url(config),
+        json={"ok": True, "result": []},
+        status=200,
+    )
+
+    monitor.send_daily_digest_entries([entry for entry in entries if entry is not None], "https://vk.com/wall-123")
+
+    send_calls = [call for call in responses.calls if "/sendMessage" in call.request.url]
+    media_calls = [call for call in responses.calls if "/sendMediaGroup" in call.request.url]
+    assert len(send_calls) == 1
+    assert "https://vk.com/wall-123" in extract_message_text(send_calls[0])
+    assert len(media_calls) == 2
+    assert len(extract_media_payload(media_calls[0])) == 10
+    assert len(extract_media_payload(media_calls[1])) == 1
+    monitor.close()
+
+
+@responses.activate
+def test_digest_command_builds_current_day_without_persisting_state(tmp_path: Path) -> None:
+    config = make_config(tmp_path, enable_daily_digest=True)
+    state = StateStore(config.state_path)
+    monitor = Monitor(config=config, state=state, sleeper=lambda _: None)
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={"ok": True, "result": [{"update_id": 700, "message": {"chat": {"id": 123456}, "text": "/digest"}}]},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={
+            "response": {
+                "items": [
+                    {
+                        "id": 8,
+                        "owner_id": -123,
+                        "date": utc_ts(2026, 3, 16),
+                        "text": "Today digest",
+                    }
+                ]
+            }
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 701}},
+        status=200,
+    )
+
+    monitor.poll_telegram_updates_once()
+
+    assert count_calls(responses.calls, "/sendMessage") == 1
+    assert state.get_meta("last_daily_digest_date_sent") is None
+    assert state.get_meta("last_tg_update_id") == "700"
+    monitor.close()
+
+
+@responses.activate
+def test_run_processes_startup_daily_digest_catch_up(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        enable_instant_alerts=False,
+        enable_daily_digest=True,
+        daily_digest_time="08:00",
+    )
+    state = StateStore(config.state_path)
+    state.set_last_seen(-123, 1)
+    sleeps: list[float] = []
+
+    def stop_after_first_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monitor = Monitor(config=config, state=state, sleeper=stop_after_first_sleep)
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={"response": {"items": []}},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        tg_get_updates_url(config),
+        json={"ok": True, "result": []},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        VK_URL,
+        json={
+            "response": {
+                "items": [
+                    {
+                        "id": 5,
+                        "owner_id": -123,
+                        "date": utc_ts(2026, 3, 15),
+                        "text": "Yesterday digest",
+                    }
+                ]
+            }
+        },
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        tg_url(config),
+        json={"ok": True, "result": {"message_id": 900}},
+        status=200,
+    )
+
+    exit_code = command_run(monitor)
+
+    assert exit_code == 0
+    assert state.get_meta("last_daily_digest_date_sent") == (date(2026, 3, 16) - timedelta(days=1)).isoformat()
+    assert sleeps
+    monitor.close()

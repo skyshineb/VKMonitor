@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,6 +26,10 @@ except ImportError:  # pragma: no cover - optional dependency
 VK_API_URL = "https://api.vk.com/method/wall.get"
 TG_API_BASE = "https://api.telegram.org"
 BACKOFF_SCHEDULE_SECONDS = (5, 15, 60, 300)
+TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_MEDIA_GROUP_LIMIT = 10
+DAILY_DIGEST_RETRY_SECONDS = 300
 
 
 class VKMonitorError(Exception):
@@ -52,6 +56,12 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+def parse_csv_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def parse_keywords(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -62,6 +72,13 @@ def parse_bool(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_time_of_day(raw: str) -> dt_time:
+    try:
+        return datetime.strptime(raw.strip(), "%H:%M").time()
+    except ValueError as exc:
+        raise ValueError("daily_digest_time must be in HH:MM format.") from exc
 
 
 @dataclass
@@ -83,6 +100,10 @@ class Config:
     state_path: Path
     timezone_name: str
     tg_updates_interval_seconds: int
+    enable_instant_alerts: bool
+    enable_daily_digest: bool
+    daily_digest_time: str
+    digest_line_excludes: list[str]
     http_timeout_seconds: float = 15.0
 
     def validate(self, command: str) -> None:
@@ -100,6 +121,8 @@ class Config:
             raise ValueError("tg_updates_interval_seconds must be >= 1.")
         if self.mode not in {"any", "all"}:
             raise ValueError("mode must be 'any' or 'all'.")
+        if command == "run" and not self.enable_instant_alerts and not self.enable_daily_digest:
+            raise ValueError("At least one of ENABLE_INSTANT_ALERTS or ENABLE_DAILY_DIGEST must be enabled.")
         if command in {"test-telegram", "test_telegram"} and (not self.tg_bot_token or not self.tg_chat_id):
             raise ValueError("TG_BOT_TOKEN and TG_CHAT_ID are required for test-telegram.")
         if command in {"run", "check-once", "check_once"} and not self.dry_run:
@@ -109,6 +132,7 @@ class Config:
             ZoneInfo(self.timezone_name)
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"Invalid timezone: {self.timezone_name}") from exc
+        parse_time_of_day(self.daily_digest_time)
 
 
 class StateStore:
@@ -268,6 +292,16 @@ class CheckResult:
     last_checked_post_id: int | None
 
 
+@dataclass
+class DailyDigestPost:
+    owner_id: int
+    post_id: int
+    unix_ts: int
+    text: str
+    photo_urls: list[str]
+    digest_date_local: str
+
+
 class Monitor:
     def __init__(
         self,
@@ -290,16 +324,30 @@ class Monitor:
             if self.config.keywords_regex
             else None
         )
+        self.daily_digest_time_of_day = parse_time_of_day(self.config.daily_digest_time)
+        self.daily_digest_buffer: dict[str, dict[tuple[int, int], DailyDigestPost]] = {}
+        self.next_daily_digest_at: datetime | None = None
+        self.pending_daily_digest_date: date | None = None
 
     def close(self) -> None:
         self.state.close()
         self.session.close()
 
-    def _vk_params(self) -> dict[str, Any]:
+    def _local_tz(self) -> ZoneInfo:
+        return ZoneInfo(self.config.timezone_name)
+
+    def _now_utc(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _now_local(self) -> datetime:
+        return self._now_utc().astimezone(self._local_tz())
+
+    def _vk_params(self, offset: int = 0, count: int | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {
             "access_token": self.config.vk_access_token,
-            "count": self.config.count,
+            "count": count if count is not None else self.config.count,
             "filter": self.config.wall_filter,
+            "offset": offset,
             "v": self.config.vk_api_version,
         }
         if self.config.vk_domain:
@@ -308,11 +356,11 @@ class Monitor:
             params["owner_id"] = self.config.vk_owner_id
         return params
 
-    def fetch_vk_posts(self) -> list[dict[str, Any]]:
+    def fetch_vk_posts(self, offset: int = 0, count: int | None = None) -> list[dict[str, Any]]:
         try:
             response = self.session.get(
                 VK_API_URL,
-                params=self._vk_params(),
+                params=self._vk_params(offset=offset, count=count),
                 timeout=self.config.http_timeout_seconds,
             )
             response.raise_for_status()
@@ -339,6 +387,40 @@ class Monitor:
             raise VKFatalError("VK payload does not contain response.items list.")
         return items
 
+    def fetch_posts_for_local_date(self, target_date: date) -> list[dict[str, Any]]:
+        page_size = 100
+        offset = 0
+        matched: list[dict[str, Any]] = []
+        seen_post_ids: set[int] = set()
+
+        while True:
+            items = self.fetch_vk_posts(offset=offset, count=page_size)
+            if not items:
+                break
+
+            has_at_or_after_target = False
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    post_id = int(item.get("id", 0))
+                    unix_ts = int(item["date"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                local_date = self._local_datetime_from_unix(unix_ts).date()
+                if local_date >= target_date:
+                    has_at_or_after_target = True
+                if local_date == target_date and post_id not in seen_post_ids:
+                    seen_post_ids.add(post_id)
+                    matched.append(item)
+
+            if len(items) < page_size or not has_at_or_after_target:
+                break
+            offset += len(items)
+
+        matched.sort(key=lambda post: (int(post.get("date", 0)), int(post.get("id", 0))))
+        return matched
+
     def _post_texts(self, post: dict[str, Any]) -> list[str]:
         texts = [str(post.get("text", ""))]
         copy_history = post.get("copy_history")
@@ -347,6 +429,100 @@ class Monitor:
                 if isinstance(entry, dict):
                     texts.append(str(entry.get("text", "")))
         return texts
+
+    def _extract_best_photo_url(self, photo: dict[str, Any]) -> str | None:
+        sizes = photo.get("sizes")
+        if not isinstance(sizes, list):
+            return None
+        best_url: str | None = None
+        best_area = -1
+        for size in sizes:
+            if not isinstance(size, dict):
+                continue
+            url = size.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            width = int(size.get("width", 0) or 0)
+            height = int(size.get("height", 0) or 0)
+            area = width * height
+            if area > best_area:
+                best_area = area
+                best_url = url
+        return best_url
+
+    def _collect_photo_urls(self, post: dict[str, Any]) -> list[str]:
+        photo_urls: list[str] = []
+        seen: set[str] = set()
+
+        def consume_attachments(attachments: Any) -> None:
+            if not isinstance(attachments, list):
+                return
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    continue
+                if attachment.get("type") != "photo":
+                    continue
+                photo = attachment.get("photo")
+                if not isinstance(photo, dict):
+                    continue
+                url = self._extract_best_photo_url(photo)
+                if url and url not in seen:
+                    seen.add(url)
+                    photo_urls.append(url)
+
+        consume_attachments(post.get("attachments"))
+        copy_history = post.get("copy_history")
+        if isinstance(copy_history, list):
+            for entry in copy_history:
+                if isinstance(entry, dict):
+                    consume_attachments(entry.get("attachments"))
+        return photo_urls
+
+    def _filter_digest_text_lines(self, texts: list[str]) -> str:
+        excludes = [item.casefold() for item in self.config.digest_line_excludes]
+        kept_lines: list[str] = []
+        for raw_text in texts:
+            for line in raw_text.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                folded = stripped.casefold()
+                if any(exclude in folded for exclude in excludes):
+                    continue
+                kept_lines.append(stripped)
+        if not kept_lines:
+            return "[без текста]"
+        return "\n".join(kept_lines)
+
+    def build_daily_digest_post(self, post: dict[str, Any]) -> DailyDigestPost | None:
+        try:
+            owner_id = int(post["owner_id"])
+            post_id = int(post["id"])
+            unix_ts = int(post["date"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        digest_dt = self._local_datetime_from_unix(unix_ts)
+        return DailyDigestPost(
+            owner_id=owner_id,
+            post_id=post_id,
+            unix_ts=unix_ts,
+            text=self._filter_digest_text_lines(self._post_texts(post)),
+            photo_urls=self._collect_photo_urls(post),
+            digest_date_local=digest_dt.date().isoformat(),
+        )
+
+    def _buffer_daily_digest_post(self, post: dict[str, Any]) -> None:
+        digest_post = self.build_daily_digest_post(post)
+        if digest_post is None:
+            return
+        entries = self.daily_digest_buffer.setdefault(digest_post.digest_date_local, {})
+        entries[(digest_post.owner_id, digest_post.post_id)] = digest_post
+
+    def _clear_daily_digest_buffer_up_to(self, target_date: date) -> None:
+        for digest_date in list(self.daily_digest_buffer):
+            if digest_date <= target_date.isoformat():
+                self.daily_digest_buffer.pop(digest_date, None)
 
     def match_post(self, post: dict[str, Any]) -> list[str]:
         texts = [normalize_whitespace(text) for text in self._post_texts(post)]
@@ -379,10 +555,11 @@ class Monitor:
             return []
         return present_keywords
 
+    def _local_datetime_from_unix(self, unix_ts: int) -> datetime:
+        return datetime.fromtimestamp(unix_ts, tz=timezone.utc).astimezone(self._local_tz())
+
     def _format_timestamp(self, unix_ts: int) -> str:
-        local_tz = ZoneInfo(self.config.timezone_name)
-        dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc).astimezone(local_tz)
-        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+        return self._local_datetime_from_unix(unix_ts).strftime("%Y-%m-%d %H:%M:%S %Z")
 
     def _format_iso_timestamp_for_status(self, iso_ts: str | None) -> str:
         if not iso_ts:
@@ -391,8 +568,7 @@ class Monitor:
             dt = datetime.fromisoformat(iso_ts)
         except ValueError:
             return "n/a"
-        local_tz = ZoneInfo(self.config.timezone_name)
-        return dt.astimezone(local_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+        return dt.astimezone(self._local_tz()).strftime("%Y-%m-%d %H:%M:%S %Z")
 
     def build_post_message(self, post: dict[str, Any], matched_terms: list[str]) -> str:
         owner_id = int(post["owner_id"])
@@ -413,6 +589,32 @@ class Monitor:
             ]
         )
 
+    def _send_telegram_request(self, method: str, data: dict[str, str]) -> None:
+        url = f"{TG_API_BASE}/bot{self.config.tg_bot_token}/{method}"
+        response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
+        if response.status_code == 429:
+            retry_after = 1
+            try:
+                payload = response.json()
+                retry_after = int(
+                    (payload.get("parameters", {}) or {}).get("retry_after", retry_after)
+                )
+            except ValueError:
+                pass
+            self.logger.warning("Telegram rate limited. Retrying in %ss.", retry_after)
+            self.sleep(max(1, retry_after))
+            response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
+
+        if response.status_code >= 400:
+            raise TelegramError(f"Telegram HTTP {response.status_code}: {response.text[:300]}")
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise TelegramError(f"Telegram invalid JSON response: {exc}") from exc
+        if not payload.get("ok", False):
+            raise TelegramError(f"Telegram API error: {payload}")
+
     def send_telegram_message(self, text: str) -> None:
         if self.config.dry_run:
             self.logger.info("[DRY RUN] Telegram message:\n%s", text)
@@ -425,10 +627,36 @@ class Monitor:
             if elapsed < 1.0:
                 self.sleep(1.0 - elapsed)
 
-        url = f"{TG_API_BASE}/bot{self.config.tg_bot_token}/sendMessage"
-        data = {"chat_id": self.config.tg_chat_id, "text": text}
-        self._send_telegram_with_retry(url, data)
+        self._send_telegram_request(
+            "sendMessage",
+            {"chat_id": self.config.tg_chat_id, "text": text},
+        )
         self.last_telegram_send_monotonic = self.monotonic()
+
+    def send_telegram_media_group(self, photo_urls: list[str], caption: str | None = None) -> None:
+        if not photo_urls:
+            return
+        if self.config.dry_run:
+            self.logger.info("[DRY RUN] Telegram media group: %s", photo_urls)
+            if caption:
+                self.logger.info("[DRY RUN] Telegram media group caption:\n%s", caption)
+            return
+        if not self.config.tg_bot_token or not self.config.tg_chat_id:
+            raise TelegramError("Telegram token/chat is not configured.")
+
+        for index in range(0, len(photo_urls), TELEGRAM_MEDIA_GROUP_LIMIT):
+            chunk = photo_urls[index : index + TELEGRAM_MEDIA_GROUP_LIMIT]
+            media: list[dict[str, str]] = []
+            for media_index, photo_url in enumerate(chunk):
+                item: dict[str, str] = {"type": "photo", "media": photo_url}
+                if index == 0 and media_index == 0 and caption:
+                    item["caption"] = caption
+                media.append(item)
+            self._send_telegram_request(
+                "sendMediaGroup",
+                {"chat_id": self.config.tg_chat_id, "media": json.dumps(media)},
+            )
+            self.last_telegram_send_monotonic = self.monotonic()
 
     def _get_last_tg_update_id(self) -> int:
         raw = self.state.get_meta("last_tg_update_id", "0") or "0"
@@ -441,6 +669,19 @@ class Monitor:
         normalized = normalize_whitespace(text)
         return bool(re.match(r"^/status(?:@[\w_]+)?(?:\s|$)", normalized, re.IGNORECASE))
 
+    def _is_digest_command(self, text: str) -> bool:
+        normalized = normalize_whitespace(text)
+        return bool(re.match(r"^/digest(?:@[\w_]+)?(?:\s|$)", normalized, re.IGNORECASE))
+
+    def _parse_last_daily_digest_date_sent(self) -> date | None:
+        raw = self.state.get_meta("last_daily_digest_date_sent")
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
+
     def _build_status_message(self) -> str:
         last_check = self._format_iso_timestamp_for_status(self.state.get_meta("last_check_at"))
         owner_id = self.state.get_meta("last_checked_owner_id")
@@ -448,11 +689,21 @@ class Monitor:
         last_post = "n/a"
         if owner_id and post_id:
             last_post = f"https://vk.com/wall{owner_id}_{post_id}"
+        digest_enabled = "yes" if self.config.enable_daily_digest else "no"
+        last_digest = self.state.get_meta("last_daily_digest_date_sent", "n/a") or "n/a"
+        next_digest = (
+            self._format_iso_timestamp_for_status(self.next_daily_digest_at.isoformat())
+            if self.next_daily_digest_at is not None
+            else "n/a"
+        )
         return "\n".join(
             [
                 "🟢 Running: yes",
                 f"🕒 Last check: {last_check}",
                 f"🔗 Last checked post: {last_post}",
+                f"Daily digest enabled: {digest_enabled}",
+                f"Last daily digest date: {last_digest}",
+                f"Next daily digest at: {next_digest}",
             ]
         )
 
@@ -460,6 +711,144 @@ class Monitor:
         if not self.config.tg_chat_id or chat_id != self.config.tg_chat_id:
             return
         self.send_telegram_message(self._build_status_message())
+
+    def _source_link(self, owner_id: int | None) -> str:
+        if self.config.vk_domain:
+            return f"https://vk.com/{self.config.vk_domain}"
+        if owner_id is None:
+            owner_id = self.config.vk_owner_id
+        if owner_id is None:
+            return "https://vk.com"
+        return f"https://vk.com/wall{owner_id}"
+
+    def _section_number(self, index: int) -> str:
+        if 1 <= index <= 9:
+            return f"{index}\uFE0F\u20E3"
+        return f"{index}."
+
+    def _split_long_text(self, text: str, limit: int) -> list[str]:
+        if len(text) <= limit:
+            return [text]
+        chunks: list[str] = []
+        current = ""
+        for line in text.split("\n"):
+            candidate = line if not current else f"{current}\n{line}"
+            if len(candidate) <= limit:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            if len(line) <= limit:
+                current = line
+                continue
+            start = 0
+            while start < len(line):
+                end = start + limit
+                chunks.append(line[start:end])
+                start = end
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _build_digest_text_messages(self, entries: list[DailyDigestPost], source_link: str) -> list[str]:
+        sections = [
+            f"{self._section_number(index)}\n{entry.text}"
+            for index, entry in enumerate(entries, start=1)
+        ]
+        messages: list[str] = []
+        current = ""
+        for section in sections:
+            if len(section) > TELEGRAM_TEXT_LIMIT:
+                if current:
+                    messages.append(current)
+                    current = ""
+                messages.extend(self._split_long_text(section, TELEGRAM_TEXT_LIMIT))
+                continue
+            candidate = section if not current else f"{current}\n\n{section}"
+            if len(candidate) <= TELEGRAM_TEXT_LIMIT:
+                current = candidate
+                continue
+            if current:
+                messages.append(current)
+            current = section
+        if current:
+            messages.append(current)
+        if not messages:
+            messages = [source_link]
+        else:
+            suffix = f"\n\n{source_link}"
+            if len(messages[-1]) + len(suffix) <= TELEGRAM_TEXT_LIMIT:
+                messages[-1] = f"{messages[-1]}{suffix}"
+            else:
+                messages.append(source_link)
+        return messages
+
+    def _collect_all_digest_photo_urls(self, entries: list[DailyDigestPost]) -> list[str]:
+        photo_urls: list[str] = []
+        for entry in entries:
+            photo_urls.extend(entry.photo_urls)
+        return photo_urls
+
+    def send_daily_digest_entries(self, entries: list[DailyDigestPost], source_link: str) -> bool:
+        if not entries:
+            return False
+
+        text_messages = self._build_digest_text_messages(entries, source_link)
+        all_photo_urls = self._collect_all_digest_photo_urls(entries)
+        can_combine_single_post = (
+            len(entries) == 1
+            and bool(all_photo_urls)
+            and len(text_messages) == 1
+            and len(text_messages[0]) <= TELEGRAM_CAPTION_LIMIT
+        )
+
+        if can_combine_single_post:
+            self.send_telegram_media_group(all_photo_urls, caption=text_messages[0])
+            return True
+
+        for text in text_messages:
+            self.send_telegram_message(text)
+        if all_photo_urls:
+            self.send_telegram_media_group(all_photo_urls)
+        return True
+
+    def _entries_from_posts(self, posts: list[dict[str, Any]]) -> list[DailyDigestPost]:
+        entries: list[DailyDigestPost] = []
+        seen: set[tuple[int, int]] = set()
+        for post in posts:
+            entry = self.build_daily_digest_post(post)
+            if entry is None:
+                continue
+            key = (entry.owner_id, entry.post_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(entry)
+        entries.sort(key=lambda item: (item.unix_ts, item.post_id))
+        return entries
+
+    def _daily_digest_entries_for_date(self, target_date: date) -> list[DailyDigestPost]:
+        digest_key = target_date.isoformat()
+        if digest_key in self.daily_digest_buffer:
+            entries = list(self.daily_digest_buffer[digest_key].values())
+            entries.sort(key=lambda item: (item.unix_ts, item.post_id))
+            return entries
+        return self._entries_from_posts(self.fetch_posts_for_local_date(target_date))
+
+    def _mark_daily_digest_sent(self, target_date: date) -> None:
+        self.state.set_meta("last_daily_digest_date_sent", target_date.isoformat(), immediate=True)
+        self.state.commit_with_pending_meta()
+
+    def handle_digest_command(self, chat_id: str) -> None:
+        if not self.config.tg_chat_id or chat_id != self.config.tg_chat_id:
+            return
+        target_date = self._now_local().date()
+        entries = self._entries_from_posts(self.fetch_posts_for_local_date(target_date))
+        if not entries:
+            self.send_telegram_message("VK digest: no posts for the current day yet.")
+            return
+        self.send_daily_digest_entries(entries, self._source_link(entries[0].owner_id))
 
     def handle_telegram_update(self, update: dict[str, Any]) -> None:
         message = update.get("message")
@@ -474,6 +863,8 @@ class Monitor:
             return
         if self._is_status_command(text):
             self.handle_status_command(chat_id)
+        elif self._is_digest_command(text):
+            self.handle_digest_command(chat_id)
 
     def poll_telegram_updates_once(self) -> None:
         if not self.config.tg_bot_token or not self.config.tg_chat_id:
@@ -519,31 +910,6 @@ class Monitor:
         if max_update_id is not None:
             self.state.set_meta("last_tg_update_id", str(max_update_id), immediate=False)
             self.state.commit_with_pending_meta()
-
-    def _send_telegram_with_retry(self, url: str, data: dict[str, str]) -> None:
-        response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
-        if response.status_code == 429:
-            retry_after = 1
-            try:
-                payload = response.json()
-                retry_after = int(
-                    (payload.get("parameters", {}) or {}).get("retry_after", retry_after)
-                )
-            except ValueError:
-                pass
-            self.logger.warning("Telegram rate limited. Retrying in %ss.", retry_after)
-            self.sleep(max(1, retry_after))
-            response = self.session.post(url, data=data, timeout=self.config.http_timeout_seconds)
-
-        if response.status_code >= 400:
-            raise TelegramError(f"Telegram HTTP {response.status_code}: {response.text[:300]}")
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise TelegramError(f"Telegram invalid JSON response: {exc}") from exc
-        if not payload.get("ok", False):
-            raise TelegramError(f"Telegram API error: {payload}")
 
     def maybe_send_recovery_message(self) -> bool:
         was_unclean, last_error = self.state.start_runtime()
@@ -596,6 +962,14 @@ class Monitor:
         sent_count = 0
         for post in new_posts:
             post_id = int(post["id"])
+            if self.config.enable_daily_digest and persist_state:
+                self._buffer_daily_digest_post(post)
+
+            if not self.config.enable_instant_alerts:
+                if persist_state and not self.config.dry_run:
+                    self.state.set_last_seen(owner_id, post_id, commit=True)
+                continue
+
             if self.state.is_notified(owner_id, post_id):
                 self.logger.info("Post %s already notified; skipping duplicate.", post_id)
                 if persist_state and not self.config.dry_run:
@@ -633,6 +1007,49 @@ class Monitor:
                 self.logger.warning("Transient VK error: %s. Retrying in %ss.", exc, delay)
                 self.sleep(delay)
                 attempt += 1
+
+    def _schedule_next_daily_digest(self) -> None:
+        if not self.config.enable_daily_digest:
+            self.next_daily_digest_at = None
+            return
+        now_local = self._now_local()
+        scheduled_local = datetime.combine(
+            now_local.date(),
+            self.daily_digest_time_of_day,
+            tzinfo=self._local_tz(),
+        )
+        if now_local >= scheduled_local:
+            scheduled_local += timedelta(days=1)
+        self.next_daily_digest_at = scheduled_local.astimezone(timezone.utc)
+
+    def initialize_daily_digest_schedule(self) -> None:
+        if not self.config.enable_daily_digest:
+            self.next_daily_digest_at = None
+            self.pending_daily_digest_date = None
+            return
+        yesterday = self._now_local().date() - timedelta(days=1)
+        last_sent = self._parse_last_daily_digest_date_sent()
+        if last_sent != yesterday:
+            self.pending_daily_digest_date = yesterday
+            self.next_daily_digest_at = self._now_utc()
+            return
+        self.pending_daily_digest_date = None
+        self._schedule_next_daily_digest()
+
+    def process_daily_digest_due(self) -> None:
+        if not self.config.enable_daily_digest:
+            return
+        target_date = self.pending_daily_digest_date
+        if target_date is None:
+            target_date = self._now_local().date() - timedelta(days=1)
+        entries = self._daily_digest_entries_for_date(target_date)
+        if entries:
+            self.send_daily_digest_entries(entries, self._source_link(entries[0].owner_id))
+        if not self.config.dry_run:
+            self._mark_daily_digest_sent(target_date)
+        self._clear_daily_digest_buffer_up_to(target_date)
+        self.pending_daily_digest_date = None
+        self._schedule_next_daily_digest()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -710,6 +1127,10 @@ def build_config(args: argparse.Namespace) -> Config:
         state_path=Path(state_path_raw),
         timezone_name=env("TIMEZONE", "Europe/Berlin") or "Europe/Berlin",
         tg_updates_interval_seconds=tg_updates_interval,
+        enable_instant_alerts=parse_bool(env("ENABLE_INSTANT_ALERTS"), True),
+        enable_daily_digest=parse_bool(env("ENABLE_DAILY_DIGEST"), False),
+        daily_digest_time=env("DAILY_DIGEST_TIME", "08:00") or "08:00",
+        digest_line_excludes=parse_csv_list(env("DIGEST_LINE_EXCLUDES")),
     )
 
 
@@ -746,12 +1167,22 @@ def command_check_once(monitor: Monitor) -> int:
 def command_run(monitor: Monitor) -> int:
     _install_sigterm_handler()
     monitor.maybe_send_recovery_message()
+    monitor.initialize_daily_digest_schedule()
     logger = logging.getLogger("vk_wall_monitor")
 
     backoff_index = 0
     now_monotonic = monitor.monotonic()
     next_vk_due = now_monotonic
     next_tg_due = now_monotonic
+    next_digest_due = (
+        now_monotonic
+        if monitor.next_daily_digest_at is not None and monitor.next_daily_digest_at <= monitor._now_utc()
+        else (
+            now_monotonic + max(0.0, (monitor.next_daily_digest_at - monitor._now_utc()).total_seconds())
+            if monitor.next_daily_digest_at is not None
+            else float("inf")
+        )
+    )
     monitor.state.set_meta("next_check_at", datetime.now(timezone.utc).isoformat(), immediate=False)
 
     try:
@@ -795,7 +1226,23 @@ def command_run(monitor: Monitor) -> int:
                 monitor.poll_telegram_updates_once()
                 next_tg_due = monitor.monotonic() + monitor.config.tg_updates_interval_seconds
 
-            sleep_for = max(0.0, min(next_vk_due, next_tg_due) - monitor.monotonic())
+            now_monotonic = monitor.monotonic()
+            if now_monotonic >= next_digest_due:
+                try:
+                    monitor.process_daily_digest_due()
+                    if monitor.next_daily_digest_at is None:
+                        next_digest_due = float("inf")
+                    else:
+                        next_digest_due = monitor.monotonic() + max(
+                            0.0,
+                            (monitor.next_daily_digest_at - monitor._now_utc()).total_seconds(),
+                        )
+                except VKMonitorError as exc:
+                    monitor.state.set_last_error(str(exc))
+                    logger.warning("Daily digest failed: %s. Retrying in %ss.", exc, DAILY_DIGEST_RETRY_SECONDS)
+                    next_digest_due = monitor.monotonic() + DAILY_DIGEST_RETRY_SECONDS
+
+            sleep_for = max(0.0, min(next_vk_due, next_tg_due, next_digest_due) - monitor.monotonic())
             if sleep_for > 0:
                 monitor.sleep(sleep_for)
     except KeyboardInterrupt:

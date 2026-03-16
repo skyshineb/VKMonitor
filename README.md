@@ -3,6 +3,7 @@
 Small production-ready monitor for one public VK group wall.
 
 It polls VK `wall.get`, checks keywords (or regex), and sends instant Telegram messages for matching new posts.
+It can also build a daily digest with in-memory accumulation plus on-demand `/digest` generation.
 State is stored in SQLite to avoid duplicate alerts after restart.
 
 ## Features
@@ -12,12 +13,14 @@ State is stored in SQLite to avoid duplicate alerts after restart.
 - Keyword modes: `any` (default) / `all` (case-insensitive for `KEYWORDS`).
 - Optional regex mode (`KEYWORDS_REGEX`) with case-insensitive search.
 - Searches in post text and `copy_history` text.
+- Independent modes: instant alerts and/or daily digest.
+- Daily digest: collects all new posts for the day in memory, filters configured text lines, and sends a morning summary with photos.
 - Duplicate protection with SQLite in `run` mode:
 `last_seen_post_id` per wall owner; `notified_posts` table to avoid re-sending same post.
 - Telegram safety:
 max 1 msg/sec local pacing; retries once on Telegram 429 using `retry_after`.
 - Telegram inbound commands:
-periodic `getUpdates` polling in `run` mode (default every 30s) with `/status` support.
+periodic `getUpdates` polling in `run` mode (default every 30s) with `/status` and `/digest` support.
 - VK backoff on rate limit/network: `5s, 15s, 60s, 300s`
 - Recovery system message:
 if previous run ended uncleanly, next startup sends a Telegram system alert.
@@ -57,6 +60,10 @@ KEYWORDS=discount,sale,promo
 # KEYWORDS_REGEX=promo\s+\d+
 
 MATCH_MODE=any
+ENABLE_INSTANT_ALERTS=1
+ENABLE_DAILY_DIGEST=0
+DAILY_DIGEST_TIME=08:00
+DIGEST_LINE_EXCLUDES=unsubscribe,view in browser
 POLL_INTERVAL_SECONDS=30
 TG_UPDATES_INTERVAL_SECONDS=30
 VK_COUNT=10
@@ -100,10 +107,19 @@ Status command (in configured `TG_CHAT_ID`):
 /status
 ```
 
+Manual digest test command (in configured `TG_CHAT_ID`):
+
+```text
+/digest
+```
+
 Bot replies with:
 - `🟢 Running: yes`
 - `🕒 Last check: ...`
 - `🔗 Last checked post: https://vk.com/wall{owner_id}_{post_id}` (or `n/a`)
+- `Daily digest enabled: yes|no`
+- `Last daily digest date: YYYY-MM-DD` (or `n/a`)
+- `Next daily digest at: ...`
 
 `check-once` is read-only: it does not update SQLite state.
 Use it for diagnostics/manual checks, not for long-running deduplicated monitoring.
@@ -186,6 +202,9 @@ Use `run` with systemd if you need deduplication across polling cycles.
 - First run is baseline-only: no historical spam.
 - `run` updates state and prevents duplicate notifications across polls.
 - `check-once` does not save state (read-only mode) and may re-notify the same post on repeated runs.
+- Daily digest keeps collected posts in memory during the day; on crash the current digest can be lost.
+- Scheduled daily digest persists only the successful sent date in SQLite.
+- `/digest` is read-only: it gathers posts from local `00:00` of the current day via VK pagination and does not mutate digest state.
 - On unclean stop (crash/power loss), next startup sends one recovery system message.
 - Tokens are never logged.
 
